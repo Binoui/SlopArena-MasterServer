@@ -1,1 +1,5 @@
-bin/\nobj/\n.vs/\n*.user
+bin/
+obj/
+.vs/
+*.user
+.env
