@@ -4,3 +4,16 @@ GET {{MasterServer_HostAddress}}/health
 Accept: application/json
 
 ###
+
+###
+
+# Guest auth → copy the token into the Bearer header below
+POST {{MasterServer_HostAddress}}/auth/guest
+Accept: application/json
+
+###
+
+# Server browser list (requires guest JWT as Bearer)
+GET {{MasterServer_HostAddress}}/servers
+Authorization: Bearer {{jwt}}
+Accept: application/json

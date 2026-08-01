@@ -269,6 +269,32 @@ app.MapPost("/servers/{serverId}/heartbeat", async (
     return Results.Ok(new { status = "ok" });
 });
 
+// ── Server browser list endpoint (issue #31) ──
+// Returns heartbeat-fresh (< 15s), non-full game servers. Requires a guest JWT.
+app.MapGet("/servers", async (AppDbContext db) =>
+{
+    var cutoff = DateTime.UtcNow.AddSeconds(-15);
+
+    var servers = await db.GameServers
+        .Where(s => s.LastHeartbeat > cutoff && s.CurrentMatches < s.MaxConcurrentMatches)
+        .OrderByDescending(s => s.IsOfficial)
+        .ThenBy(s => s.Name)
+        .Select(s => new
+        {
+            id = s.Id,
+            name = s.Name,
+            ipAddress = s.IpAddress,
+            port = s.Port,
+            region = s.Region,
+            currentMatches = s.CurrentMatches,
+            maxConcurrentMatches = s.MaxConcurrentMatches,
+            isOfficial = s.IsOfficial
+        })
+        .ToListAsync();
+
+    return Results.Ok(servers);
+}).RequireAuthorization();
+
 // ── Match result endpoint ──
 app.MapPost("/match/result", async (
     MatchResultRequest request,
