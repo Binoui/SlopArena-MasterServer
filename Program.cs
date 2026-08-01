@@ -3,6 +3,11 @@ using System.Security.Cryptography;
 using Microsoft.EntityFrameworkCore;
 using MasterServer.Data;
 using MasterServer.DTOs;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -13,6 +18,30 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSignalR();
+// JWT authentication — guest/dev auth (issue #30)
+var jwtSecret = builder.Configuration["Jwt:Secret"];
+if (string.IsNullOrWhiteSpace(jwtSecret))
+    throw new InvalidOperationException("Jwt:Secret is not configured. Set it in appsettings, .env, or environment variable.");
+var jwtIssuer = builder.Configuration["Jwt:Issuer"] ?? "SlopArena.Master";
+var jwtAudience = builder.Configuration["Jwt:Audience"] ?? "SlopArena.Client";
+var jwtExpiryHours = builder.Configuration.GetValue<int>("Jwt:ExpiryHours", 24);
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = jwtIssuer,
+            ValidAudience = jwtAudience,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),
+            ClockSkew = TimeSpan.Zero
+        };
+    });
+builder.Services.AddAuthorization();
 
 var app = builder.Build();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
@@ -44,6 +73,8 @@ app.Use(async (context, next) =>
 
     await next(context);
 });
+app.UseAuthentication();
+app.UseAuthorization();
 
 // ── Helper: extract and validate Bearer token ──
 static string? ExtractBearerToken(HttpContext httpContext, ILogger logger)
@@ -54,6 +85,7 @@ static string? ExtractBearerToken(HttpContext httpContext, ILogger logger)
         logger.LogWarning("Missing Authorization header");
         return null;
     }
+
 
     // Case-insensitive "Bearer " prefix check with trim
     const string prefix = "Bearer ";
@@ -90,6 +122,67 @@ static bool IsValidIpAddress(string ip)
 
 // ── Helper: validate port range ──
 static bool IsValidPort(int port) => port > 0 && port <= 65535;
+
+// ── Guest auth endpoint (issue #30) ──
+app.MapPost("/auth/guest", async (AppDbContext db) =>
+{
+    // Generate a guest SteamId below the real Steam ID range (76561197960265729+)
+    long steamId = Random.Shared.NextInt64(1, 76561197960265728);
+
+    var user = new MasterServer.Data.Models.User
+    {
+        SteamId = steamId,
+        Username = $"Guest-{Random.Shared.Next(10000, 99999)}",
+        Mmr = 1000,
+        CreatedAt = DateTime.UtcNow,
+        LastLogin = DateTime.UtcNow
+    };
+
+    db.Users.Add(user);
+    await db.SaveChangesAsync();
+
+    var token = GenerateGuestJwt(steamId);
+
+    logger.LogInformation("Guest auth: created user {SteamId} ({Username})", steamId, user.Username);
+
+    return Results.Ok(new GuestAuthResponse(token, steamId));
+});
+
+// ── Authed endpoint: get current user info (issue #30) ──
+app.MapGet("/auth/me", async (HttpContext httpContext, AppDbContext db) =>
+{
+    var steamIdClaim = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+    if (steamIdClaim == null || !long.TryParse(steamIdClaim, out var steamId))
+        return Results.Unauthorized();
+
+    var user = await db.Users.FindAsync(steamId);
+    if (user == null)
+        return Results.NotFound(new { error = "User not found" });
+
+    return Results.Ok(new GuestUserInfo(user.SteamId, user.Username, user.Mmr));
+}).RequireAuthorization();
+
+// ── Helper: generate a guest JWT (captures jwt config from top-level scope) ──
+string GenerateGuestJwt(long steamId)
+{
+    var claims = new[]
+    {
+        new Claim(ClaimTypes.NameIdentifier, steamId.ToString()),
+        new Claim("steam_id", steamId.ToString())
+    };
+
+    var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret));
+    var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+    var token = new JwtSecurityToken(
+        issuer: jwtIssuer,
+        audience: jwtAudience,
+        claims: claims,
+        expires: DateTime.UtcNow.AddHours(jwtExpiryHours),
+        signingCredentials: credentials);
+
+    return new JwtSecurityTokenHandler().WriteToken(token);
+}
 
 // ── Game server registration endpoint ──
 app.MapPost("/servers/register", async (
