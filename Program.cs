@@ -3,6 +3,8 @@ using System.Security.Cryptography;
 using Microsoft.EntityFrameworkCore;
 using MasterServer.Data;
 using MasterServer.DTOs;
+using MasterServer.Hubs;
+using MasterServer.Lobbies;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
@@ -29,6 +31,24 @@ var jwtExpiryHours = builder.Configuration.GetValue<int>("Jwt:ExpiryHours", 24);
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
     {
+        // SignalR/WebSocket connections cannot set Authorization headers from
+        // browsers, so the client passes the JWT as a "access_token" query
+        // string parameter. Extract and validate it here.
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var accessToken = context.Request.Query["access_token"];
+                var path = context.HttpContext.Request.Path;
+                if (!string.IsNullOrEmpty(accessToken) &&
+                    path.StartsWithSegments("/lobby"))
+                {
+                    context.Token = accessToken!;
+                }
+                return Task.CompletedTask;
+            }
+        };
+
         options.TokenValidationParameters = new TokenValidationParameters
         {
             ValidateIssuer = true,
@@ -41,6 +61,10 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ClockSkew = TimeSpan.Zero
         };
     });
+
+// ── Lobby services (issue #32) ──
+builder.Services.AddSingleton<LobbyManager>();
+builder.Services.AddSingleton<IMatchLauncher, StubMatchLauncher>();
 builder.Services.AddAuthorization();
 
 var app = builder.Build();
@@ -373,7 +397,13 @@ app.MapPost("/match/result", async (
     }
 });
 
+// ── SignalR lobby hub (issue #32) ──
+app.MapHub<LobbyHub>("/lobby");
+
 app.Run();
+
+// Exposed for the test host (WebApplicationFactory<Program>).
+public partial class Program { }
 
 /// <summary>
 /// Simple in-memory rate limit tracker with auto-cleanup.

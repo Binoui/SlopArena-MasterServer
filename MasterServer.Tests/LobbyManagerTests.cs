@@ -1,0 +1,255 @@
+// MasterServer.Tests/LobbyManagerTests.cs
+using MasterServer.Lobbies;
+using Xunit;
+
+namespace MasterServer.Tests;
+
+/// <summary>
+/// Pure state-machine tests for <see cref="LobbyManager"/> — no SignalR, no DB.
+/// These cover the join/leave/host-promotion/host-check contracts from issue #32.
+/// </summary>
+public class LobbyManagerTests
+{
+    private static readonly Guid ServerA = Guid.Parse("11111111-1111-1111-1111-111111111111");
+    private static readonly Guid ServerB = Guid.Parse("22222222-2222-2222-2222-222222222222");
+
+    [Fact]
+    public void JoinLobby_FirstPlayer_IsHost()
+    {
+        var mgr = new LobbyManager();
+
+        var result = mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+
+        Assert.True(result.Player.IsHost);
+        Assert.Equal("Alice", result.Player.Name);
+        Assert.Equal(101, result.Player.SteamId);
+        Assert.Single(result.Snapshot.Players);
+        Assert.Equal(ServerA, result.Snapshot.ServerId);
+    }
+
+    [Fact]
+    public void JoinLobby_SecondPlayer_NotHost()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+
+        var result = mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+
+        Assert.False(result.Player.IsHost);
+        Assert.Equal(2, result.Snapshot.Players.Count);
+    }
+
+    [Fact]
+    public void LobbyUpdated_Pushed_On_Join()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+
+        var result = mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+
+        Assert.Equal(2, result.Snapshot.Players.Count);
+        Assert.Contains(result.Snapshot.Players, p => p.SteamId == 101);
+        Assert.Contains(result.Snapshot.Players, p => p.SteamId == 202);
+    }
+
+    [Fact]
+    public void LeaveLobby_RemovesPlayer()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+
+        var result = mgr.LeaveLobby("c2");
+
+        Assert.Equal(ServerA, result.ServerId);
+        Assert.NotNull(result.Player);
+        Assert.Equal(202, result.Player!.SteamId);
+        Assert.Single(result.Snapshot!.Players);
+    }
+
+    [Fact]
+    public void LeaveLobby_EmptyLobby_ReapsIt()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+
+        mgr.LeaveLobby("c1");
+
+        // Re-joining after the lobby was reaped starts fresh → first player is host again.
+        var rejoin = mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        Assert.True(rejoin.Player.IsHost);
+    }
+
+    [Fact]
+    public void LeaveLobby_HostDeparts_PromotesNextPlayer()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+
+        // Alice (host) leaves — Bob should be promoted.
+        mgr.LeaveLobby("c1");
+
+        var snapshot = mgr.GetSnapshot("c2");
+        Assert.NotNull(snapshot);
+        Assert.Single(snapshot!.Players);
+        Assert.True(snapshot.Players[0].IsHost);
+        Assert.Equal(202, snapshot.Players[0].SteamId);
+    }
+
+    [Fact]
+    public void LeaveLobby_NonMember_ReturnsNull()
+    {
+        var mgr = new LobbyManager();
+
+        var result = mgr.LeaveLobby("nobody");
+
+        Assert.Null(result.ServerId);
+        Assert.Null(result.Player);
+        Assert.Null(result.Snapshot);
+    }
+
+    [Fact]
+    public void LeaveLobby_LastPlayer_SnapshotIsNull()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+
+        var result = mgr.LeaveLobby("c1");
+
+        Assert.Equal(ServerA, result.ServerId);
+        Assert.Null(result.Snapshot);
+    }
+
+    [Fact]
+    public void JoinLobby_RejoinSameServer_DropsPriorMembership()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+
+        // Same connection switches servers.
+        var result = mgr.JoinLobby(ServerB, "c1", 101, "Alice");
+
+        Assert.Equal(ServerB, result.Snapshot.ServerId);
+        Assert.True(result.Player.IsHost);
+
+        // ServerA's lobby should be empty/reaped.
+        var fresh = mgr.JoinLobby(ServerA, "c3", 303, "Carol");
+        Assert.True(fresh.Player.IsHost);
+    }
+
+    [Fact]
+    public void TryHostStart_Host_Succeeds()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+
+        var result = mgr.TryHostStart("c1");
+
+        Assert.True(result.Success);
+        Assert.Null(result.Error);
+        Assert.NotNull(result.Config);
+        Assert.Equal(ServerA, result.Config!.ServerId);
+        Assert.Equal(2, result.Config.Players.Count);
+    }
+
+    [Fact]
+    public void TryHostStart_NonHost_Rejected()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+
+        var result = mgr.TryHostStart("c2");
+
+        Assert.False(result.Success);
+        Assert.Null(result.Config);
+        Assert.Contains("host", result.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void TryHostStart_NoLobby_Rejected()
+    {
+        var mgr = new LobbyManager();
+
+        var result = mgr.TryHostStart("nobody");
+
+        Assert.False(result.Success);
+        Assert.Contains("not in a lobby", result.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void TryHostStart_PromotedHost_CanStart()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+        mgr.LeaveLobby("c1"); // Alice leaves → Bob promoted.
+
+        var result = mgr.TryHostStart("c2");
+
+        Assert.True(result.Success);
+    }
+
+    [Fact]
+    public void GetSnapshot_NonMember_ReturnsNull()
+    {
+        var mgr = new LobbyManager();
+
+        Assert.Null(mgr.GetSnapshot("nobody"));
+    }
+
+    [Fact]
+    public void JoinLobby_DistinctServers_DistinctLobbies()
+    {
+        var mgr = new LobbyManager();
+
+        var a = mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        var b = mgr.JoinLobby(ServerB, "c2", 202, "Bob");
+
+        Assert.Equal(ServerA, a.Snapshot.ServerId);
+        Assert.Equal(ServerB, b.Snapshot.ServerId);
+        Assert.True(a.Player.IsHost);
+        Assert.True(b.Player.IsHost);
+    }
+
+    [Fact]
+    public void JoinLobby_SwitchingServers_SurfacesDeparture_FromOldLobby()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+
+        // c2 leaves ServerA for ServerB — departure must be surfaced.
+        var result = mgr.JoinLobby(ServerB, "c2", 202, "Bob");
+
+        Assert.NotNull(result.Departure);
+        Assert.Equal(ServerA, result.Departure!.ServerId);
+        Assert.Equal(202, result.Departure!.Player!.SteamId);
+        // Old lobby has one survivor (Alice).
+        Assert.Single(result.Departure!.Snapshot!.Players);
+        // New lobby has just Bob.
+        Assert.Equal(ServerB, result.Snapshot.ServerId);
+        Assert.True(result.Player.IsHost);
+    }
+
+    [Fact]
+    public void JoinLobby_SameServerRejoin_DoesNotOrphanLobby()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+
+        // Duplicate join to the same server — should be a no-op, not remove+readd.
+        var result = mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+
+        Assert.Null(result.Departure);
+        Assert.True(result.Player.IsHost);
+        Assert.Single(result.Snapshot.Players);
+
+        // A second player joining the same server must land in the SAME lobby.
+        var b = mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+        Assert.Equal(2, b.Snapshot.Players.Count);
+        Assert.False(b.Player.IsHost);
+    }
+}
