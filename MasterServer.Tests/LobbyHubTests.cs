@@ -51,6 +51,11 @@ public class LobbyHubTests
                 CreatedAt = DateTime.UtcNow,
                 LastLogin = DateTime.UtcNow
             });
+            // Launcher returns a deterministic match port + default arena so the
+            // MatchStarted broadcast carries stable values (issue #35).
+            Launcher.SetupGet(l => l.DefaultArena).Returns(HttpMatchLauncher.DefaultArenaName);
+            Launcher.Setup(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()))
+                .ReturnsAsync(9877);
             db.SaveChanges();
 
             // Each hub gets its own context mock — connectionId must not bleed
@@ -367,8 +372,45 @@ public class LobbyHubTests
         harness.GroupProxy.Verify(
             p => p.SendCoreAsync("MatchStarted", It.IsAny<object[]>(), default),
             Times.Once);
+        // The launcher is invoked with the roster + entity IDs (issue #35).
         harness.Launcher.Verify(l => l.LaunchAsync(It.Is<MatchStartedConfig>(
-            c => c.ServerId == ServerId && c.Players.Count == 2)), Times.Once);
+            c => c.ServerId == ServerId
+              && c.Players.Count == 2
+              && c.Players[0].EntityId == 1
+              && c.Players[1].EntityId == 2
+              && c.Players[0].CharacterSelection == "Manki"
+              && c.Players[1].CharacterSelection == "FightGuy")), Times.Once);
+    }
+
+    [Fact]
+    public async Task StartMatch_AllLockedIn_BroadcastCarriesMatchPortAndArena()
+    {
+        // Issue #35: the MatchStarted broadcast must carry the game server's
+        // assigned UDP port + arena so clients connect to the right place.
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        await hub1.SelectCharacter("Manki");
+        await hub2.SelectCharacter("FightGuy");
+        harness.GroupProxy.Reset();
+
+        await hub1.StartMatch();
+
+        harness.Launcher.Verify(l => l.LaunchAsync(It.Is<MatchStartedConfig>(
+            c => c.ArenaName == HttpMatchLauncher.DefaultArenaName)), Times.Once);
+        // The broadcast config carries the port the launcher returned (9877).
+        // Cast (not `is` pattern) keeps this inside a Moq expression tree.
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("MatchStarted",
+                It.Is<object[]>(args => args.Length > 0
+                    && ((MatchStartedConfig)args[0]).MatchPort == 9877
+                    && ((MatchStartedConfig)args[0]).ArenaName == HttpMatchLauncher.DefaultArenaName),
+                default),
+            Times.Once);
     }
 
     [Fact]

@@ -10,7 +10,8 @@ public sealed record LobbyPlayer(
     string Name,
     string? CharacterSelection,
     bool LockedIn,
-    bool IsHost);
+    bool IsHost,
+    int EntityId = 0);
 
 /// <summary>
 /// Full lobby membership snapshot pushed on any change via <c>LobbyUpdated</c>.
@@ -24,12 +25,16 @@ public sealed record LobbySnapshot(Guid ServerId, IReadOnlyList<LobbyPlayer> Pla
 /// </summary>
 public sealed record MatchStartingConfig(Guid ServerId, IReadOnlyList<LobbyPlayer> Players);
 
-/// <summary>
 /// Payload of the <c>MatchStarted</c> push broadcast when the host starts the
 /// actual match from char select (all players locked in). Carries the final
-/// roster with character classes the game server will spawn.
+/// roster with character classes + entity IDs, the UDP port the game server
+/// assigned to the match, and the arena the game server loaded (issue #35).
 /// </summary>
-public sealed record MatchStartedConfig(Guid ServerId, IReadOnlyList<LobbyPlayer> Players);
+public sealed record MatchStartedConfig(
+    Guid ServerId,
+    IReadOnlyList<LobbyPlayer> Players,
+    int MatchPort = 0,
+    string ArenaName = "");
 
 /// <summary>
 /// Result of a player joining a lobby. The hub uses this to perform the

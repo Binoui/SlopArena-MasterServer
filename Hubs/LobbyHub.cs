@@ -107,10 +107,11 @@ public sealed class LobbyHub : Hub
     }
 
     /// <summary>
-    /// Host-only: starts the actual match from char select (issue #34).
-    /// Requires all players locked in (minimum 2). Broadcasts
-    /// <c>MatchStarted</c> with the final roster + character classes, then
-    /// launches the game server.
+    /// Host-only: starts the actual match from char select (issue #34/#35).
+    /// Requires all players locked in (minimum 2). Launches the game server
+    /// (HTTP match-start with the roster + entity IDs + character classes),
+    /// then broadcasts <c>MatchStarted</c> carrying the assigned UDP port +
+    /// arena so every client can connect and load the right scene.
     /// </summary>
     public async Task StartMatch()
     {
@@ -118,11 +119,15 @@ public sealed class LobbyHub : Hub
         if (!result.Success)
             throw new HubException(result.Error ?? "Start match rejected.");
 
-        var config = result.Config!;
+        var config = result.Config! with { ArenaName = _launcher.DefaultArena };
         _logger.LogInformation("Lobby {ServerId}: host started the match ({Count} players)", config.ServerId, config.Players.Count);
 
+        // Launch first: the game server assigns the UDP match port, which the
+        // broadcast must carry so clients know where to connect (issue #35).
+        var matchPort = await _launcher.LaunchAsync(config);
+        config = config with { MatchPort = matchPort };
+
         await Clients.Group(GroupName(config.ServerId)).SendAsync("MatchStarted", config);
-        await _launcher.LaunchAsync(config);
     }
 
     /// <summary>Cleanup on disconnect: drop the player and announce to survivors.</summary>

@@ -127,8 +127,10 @@ public sealed class LobbyManager
         if (!lobby.IsAllLockedIn(out var lockedInError))
             return new StartMatchResult(false, lockedInError, null);
 
+        var players = lobby.Snapshot().Players;
+        var withEntityIds = players.Select((p, i) => p with { EntityId = i + 1 }).ToList();
         return new StartMatchResult(true, null,
-            new MatchStartedConfig(lobby.ServerId, lobby.Snapshot().Players));
+            new MatchStartedConfig(lobby.ServerId, withEntityIds));
     }
 
     /// <summary>
@@ -266,9 +268,10 @@ public sealed class LobbyManager
             string Name,
             string? CharacterSelection,
             bool LockedIn,
-            bool IsHost)
+            bool IsHost,
+            int EntityId = 0)
         {
-            public LobbyPlayer ToPlayer() => new(SteamId, Name, CharacterSelection, LockedIn, IsHost);
+            public LobbyPlayer ToPlayer() => new(SteamId, Name, CharacterSelection, LockedIn, IsHost, EntityId);
         }
     }
 }
