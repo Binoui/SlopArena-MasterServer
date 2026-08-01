@@ -64,7 +64,11 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
 // ── Lobby services (issue #32) ──
 builder.Services.AddSingleton<LobbyManager>();
-builder.Services.AddSingleton<IMatchLauncher, StubMatchLauncher>();
+// Scoped: HttpMatchLauncher consumes the scoped AppDbContext to look up the
+// game server's IP + port before POSTing the match-start command (issue #35).
+// AddHttpClient gives the launcher a managed, pooled HttpClient (avoids socket
+// exhaustion from per-scope `new HttpClient()` — issue #35 review).
+builder.Services.AddHttpClient<IMatchLauncher, HttpMatchLauncher>();
 builder.Services.AddAuthorization();
 
 var app = builder.Build();
