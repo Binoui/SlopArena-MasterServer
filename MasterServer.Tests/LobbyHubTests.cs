@@ -167,11 +167,11 @@ public class LobbyHubTests
         harness.GroupProxy.Verify(
             p => p.SendCoreAsync("MatchStarting", It.IsAny<object[]>(), default),
             Times.Never);
-        harness.Launcher.Verify(l => l.LaunchAsync(It.IsAny<MatchStartingConfig>()), Times.Never);
+        harness.Launcher.Verify(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()), Times.Never);
     }
 
     [Fact]
-    public async Task HostStart_Host_Broadcasts_MatchStarting_And_Launches()
+    public async Task HostStart_Host_Broadcasts_MatchStarting_But_DoesNot_Launch()
     {
         var db = CreateInMemoryDb();
         var harness = new HubHarness(db);
@@ -183,11 +183,12 @@ public class LobbyHubTests
 
         await hub1.HostStart();
 
+        // HostStart transitions to char select: broadcasts MatchStarting but
+        // does NOT launch the game server (that's StartMatch, issue #34).
         harness.GroupProxy.Verify(
             p => p.SendCoreAsync("MatchStarting", It.IsAny<object[]>(), default),
             Times.Once);
-        harness.Launcher.Verify(l => l.LaunchAsync(It.Is<MatchStartingConfig>(
-            c => c.ServerId == ServerId && c.Players.Count == 2)), Times.Once);
+        harness.Launcher.Verify(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()), Times.Never);
     }
 
     [Fact]
@@ -253,5 +254,133 @@ public class LobbyHubTests
         harness.GroupProxy.Verify(
             p => p.SendCoreAsync("MatchStarting", It.IsAny<object[]>(), default),
             Times.Once);
+    }
+    [Fact]
+    public async Task SelectCharacter_LocksIn_And_Broadcasts_CharacterSelected_And_LobbyUpdated()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+
+        await hub1.JoinLobby(ServerId);
+        harness.GroupProxy.Reset();
+
+        await hub1.SelectCharacter("Manki");
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("CharacterSelected", It.IsAny<object[]>(), default),
+            Times.Once);
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("LobbyUpdated", It.IsAny<object[]>(), default),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task SelectCharacter_NonMember_Throws_HubException()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+
+        // Never joined a lobby.
+        await Assert.ThrowsAsync<HubException>(() => hub1.SelectCharacter("Manki"));
+    }
+
+    [Fact]
+    public async Task SelectCharacter_CanChangePick_Before_LockIn()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+
+        await hub1.JoinLobby(ServerId);
+
+        await hub1.SelectCharacter("Manki");
+        await hub1.SelectCharacter("FightGuy");
+
+        // Two CharacterSelected broadcasts (one per call).
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("CharacterSelected", It.IsAny<object[]>(), default),
+            Times.Exactly(2));
+    }
+
+    [Fact]
+    public async Task StartMatch_NonHost_Throws_HubException()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        await hub1.SelectCharacter("Manki");
+        await hub2.SelectCharacter("FightGuy");
+
+        await Assert.ThrowsAsync<HubException>(() => hub2.StartMatch());
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("MatchStarted", It.IsAny<object[]>(), default),
+            Times.Never);
+        harness.Launcher.Verify(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task StartMatch_NotAllLockedIn_Throws_HubException()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+
+        // Only Alice locks in; Bob hasn't.
+        await hub1.SelectCharacter("Manki");
+        harness.GroupProxy.Reset();
+
+        await Assert.ThrowsAsync<HubException>(() => hub1.StartMatch());
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("MatchStarted", It.IsAny<object[]>(), default),
+            Times.Never);
+        harness.Launcher.Verify(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task StartMatch_AllLockedIn_Broadcasts_MatchStarted_And_Launches()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        await hub1.SelectCharacter("Manki");
+        await hub2.SelectCharacter("FightGuy");
+        harness.GroupProxy.Reset();
+
+        await hub1.StartMatch();
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("MatchStarted", It.IsAny<object[]>(), default),
+            Times.Once);
+        harness.Launcher.Verify(l => l.LaunchAsync(It.Is<MatchStartedConfig>(
+            c => c.ServerId == ServerId && c.Players.Count == 2)), Times.Once);
+    }
+
+    [Fact]
+    public async Task StartMatch_SinglePlayer_Throws_HubException()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+
+        await hub1.JoinLobby(ServerId);
+        await hub1.SelectCharacter("Manki");
+
+        await Assert.ThrowsAsync<HubException>(() => hub1.StartMatch());
     }
 }

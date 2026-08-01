@@ -93,6 +93,45 @@ public sealed class LobbyManager
     }
 
     /// <summary>
+    /// Locks in a character selection for the connection's player (issue #34).
+    /// The player may call this again to change their pick before the match
+    /// starts. Returns the updated player + full snapshot for the
+    /// <c>CharacterSelected</c> + <c>LobbyUpdated</c> broadcasts.
+    /// </summary>
+    public SelectCharacterResult SelectCharacter(string connectionId, string characterClass)
+    {
+        if (!_lobbyByConnection.TryGetValue(connectionId, out var lobby))
+            return new SelectCharacterResult(false, "You are not in a lobby.", null, null);
+
+        var (player, snapshot) = lobby.SelectCharacter(connectionId, characterClass);
+        if (player is null)
+            return new SelectCharacterResult(false, "You are not in a lobby.", null, null);
+
+        return new SelectCharacterResult(true, null, player, snapshot);
+    }
+
+    /// <summary>
+    /// Host-only: starts the actual match from char select (issue #34).
+    /// Requires all players locked in and a minimum of 2 players. On success
+    /// returns the final roster with character classes for the game server
+    /// launch + <c>MatchStarted</c> broadcast.
+    /// </summary>
+    public StartMatchResult TryStartMatch(string connectionId)
+    {
+        if (!_lobbyByConnection.TryGetValue(connectionId, out var lobby))
+            return new StartMatchResult(false, "You are not in a lobby.", null);
+
+        if (!lobby.IsHostByConnection(connectionId, out _))
+            return new StartMatchResult(false, "Only the host can start the match.", null);
+
+        if (!lobby.IsAllLockedIn(out var lockedInError))
+            return new StartMatchResult(false, lockedInError, null);
+
+        return new StartMatchResult(true, null,
+            new MatchStartedConfig(lobby.ServerId, lobby.Snapshot().Players));
+    }
+
+    /// <summary>
     /// A single lobby: an ordered, locked player list. The first member is the
     /// host; on host departure the next-joined member is promoted.
     /// </summary>
@@ -108,7 +147,7 @@ public sealed class LobbyManager
             lock (_gate)
             {
                 var isHost = _members.Count == 0;
-                var member = new Member(connectionId, steamId, name, isHost);
+                var member = new Member(connectionId, steamId, name, null, false, isHost);
                 _members.Add(member);
                 return member.ToPlayer();
             }
@@ -172,9 +211,64 @@ public sealed class LobbyManager
             }
         }
 
-        private readonly record struct Member(string ConnectionId, long SteamId, string Name, bool IsHost)
+        /// <summary>
+        /// Locks in a character selection for the member on this connection
+        /// (issue #34). Returns the updated player + snapshot, or null player
+        /// if the connection is not in this lobby.
+        /// </summary>
+        public (LobbyPlayer? Player, LobbySnapshot Snapshot) SelectCharacter(
+            string connectionId, string characterClass)
         {
-            public LobbyPlayer ToPlayer() => new(SteamId, Name, null, IsHost);
+            lock (_gate)
+            {
+                var idx = _members.FindIndex(m => m.ConnectionId == connectionId);
+                if (idx < 0)
+                    return (null, Snapshot());
+
+                _members[idx] = _members[idx] with
+                {
+                    CharacterSelection = characterClass,
+                    LockedIn = true
+                };
+                return (_members[idx].ToPlayer(), Snapshot());
+            }
+        }
+
+        /// <summary>
+        /// Checks whether all members have locked in a character. Returns false
+        /// with a descriptive error if not. Minimum 2 players required.
+        /// </summary>
+        public bool IsAllLockedIn(out string? error)
+        {
+            lock (_gate)
+            {
+                if (_members.Count < 2)
+                {
+                    error = "Need at least 2 players to start.";
+                    return false;
+                }
+
+                var unlocked = _members.FirstOrDefault(m => !m.LockedIn);
+                if (unlocked != default)
+                {
+                    error = $"Waiting for {unlocked.Name} to lock in.";
+                    return false;
+                }
+
+                error = null;
+                return true;
+            }
+        }
+
+        private readonly record struct Member(
+            string ConnectionId,
+            long SteamId,
+            string Name,
+            string? CharacterSelection,
+            bool LockedIn,
+            bool IsHost)
+        {
+            public LobbyPlayer ToPlayer() => new(SteamId, Name, CharacterSelection, LockedIn, IsHost);
         }
     }
 }

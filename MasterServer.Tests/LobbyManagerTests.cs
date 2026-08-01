@@ -252,4 +252,137 @@ public class LobbyManagerTests
         Assert.Equal(2, b.Snapshot.Players.Count);
         Assert.False(b.Player.IsHost);
     }
+
+    // ── SelectCharacter (issue #34) ──
+
+    [Fact]
+    public void SelectCharacter_LocksIn_And_SetsSelection()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+
+        var result = mgr.SelectCharacter("c1", "Manki");
+
+        Assert.True(result.Success);
+        Assert.NotNull(result.Player);
+        Assert.Equal("Manki", result.Player!.CharacterSelection);
+        Assert.True(result.Player!.LockedIn);
+    }
+
+    [Fact]
+    public void SelectCharacter_Broadcasts_Updated_Snapshot()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+
+        var result = mgr.SelectCharacter("c1", "Manki");
+
+        Assert.NotNull(result.Snapshot);
+        Assert.Equal(2, result.Snapshot!.Players.Count);
+        Assert.True(result.Snapshot.Players[0].LockedIn);
+        Assert.False(result.Snapshot.Players[1].LockedIn);
+    }
+
+    [Fact]
+    public void SelectCharacter_CanChangePick()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+
+        mgr.SelectCharacter("c1", "Manki");
+        var result = mgr.SelectCharacter("c1", "FightGuy");
+
+        Assert.True(result.Success);
+        Assert.Equal("FightGuy", result.Player!.CharacterSelection);
+        Assert.True(result.Player!.LockedIn);
+    }
+
+    [Fact]
+    public void SelectCharacter_NonMember_Fails()
+    {
+        var mgr = new LobbyManager();
+
+        var result = mgr.SelectCharacter("nobody", "Manki");
+
+        Assert.False(result.Success);
+        Assert.Null(result.Player);
+        Assert.Null(result.Snapshot);
+    }
+
+    // ── TryStartMatch (issue #34) ──
+
+    [Fact]
+    public void TryStartMatch_AllLockedIn_Succeeds()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+        mgr.SelectCharacter("c1", "Manki");
+        mgr.SelectCharacter("c2", "FightGuy");
+
+        var result = mgr.TryStartMatch("c1");
+
+        Assert.True(result.Success);
+        Assert.Null(result.Error);
+        Assert.NotNull(result.Config);
+        Assert.Equal(ServerA, result.Config!.ServerId);
+        Assert.Equal(2, result.Config.Players.Count);
+        Assert.True(result.Config.Players.All(p => p.LockedIn));
+    }
+
+    [Fact]
+    public void TryStartMatch_NotAllLockedIn_Fails()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+        mgr.SelectCharacter("c1", "Manki");
+        // Bob hasn't locked in.
+
+        var result = mgr.TryStartMatch("c1");
+
+        Assert.False(result.Success);
+        Assert.Null(result.Config);
+        Assert.Contains("lock", result.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void TryStartMatch_SinglePlayer_Fails()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.SelectCharacter("c1", "Manki");
+
+        var result = mgr.TryStartMatch("c1");
+
+        Assert.False(result.Success);
+        Assert.Contains("at least 2", result.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void TryStartMatch_NonHost_Fails()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+        mgr.SelectCharacter("c1", "Manki");
+        mgr.SelectCharacter("c2", "FightGuy");
+
+        var result = mgr.TryStartMatch("c2");
+
+        Assert.False(result.Success);
+        Assert.Contains("host", result.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void TryStartMatch_NoLobby_Fails()
+    {
+        var mgr = new LobbyManager();
+
+        var result = mgr.TryStartMatch("nobody");
+
+        Assert.False(result.Success);
+        Assert.Contains("not in a lobby", result.Error, StringComparison.OrdinalIgnoreCase);
+    }
 }

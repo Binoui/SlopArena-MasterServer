@@ -14,9 +14,10 @@ namespace MasterServer.Hubs;
 /// SignalR group joins and broadcasts.
 ///
 /// Server → client pushes: <c>PlayerJoined</c>, <c>PlayerLeft</c>,
-/// <c>LobbyUpdated</c>, <c>MatchStarting</c>.
+/// <c>LobbyUpdated</c>, <c>CharacterSelected</c>, <c>MatchStarting</c>,
+/// <c>MatchStarted</c>.
 /// Client → server methods: <see cref="JoinLobby"/>, <see cref="LeaveLobby"/>,
-/// <see cref="HostStart"/>.
+/// <see cref="HostStart"/>, <see cref="SelectCharacter"/>, <see cref="StartMatch"/>.
 /// </summary>
 [Authorize]
 public sealed class LobbyHub : Hub
@@ -66,7 +67,12 @@ public sealed class LobbyHub : Hub
         await AnnounceDeparture(serverId, player, snapshot);
     }
 
-    /// <summary>Host-only: start the match for this lobby.</summary>
+    /// <summary>
+    /// Host-only: transitions the lobby to character select (ADR-0008, issue
+    /// #34). Broadcasts <c>MatchStarting</c> so all clients switch to the char
+    /// select screen. Does NOT launch the game server — that happens in
+    /// <see cref="StartMatch"/> once all players lock in.
+    /// </summary>
     public async Task HostStart()
     {
         var result = _lobbies.TryHostStart(Context.ConnectionId);
@@ -77,9 +83,45 @@ public sealed class LobbyHub : Hub
         }
 
         var config = result.Config!;
-        _logger.LogInformation("Lobby {ServerId}: host started the match", config.ServerId);
+        _logger.LogInformation("Lobby {ServerId}: host started char select", config.ServerId);
 
         await Clients.Group(GroupName(config.ServerId)).SendAsync("MatchStarting", config);
+    }
+
+    /// <summary>
+    /// Lock in a character selection (issue #34). Broadcasts
+    /// <c>CharacterSelected</c> (the updated player) and <c>LobbyUpdated</c>
+    /// (full snapshot) to all lobby members. A player may call this again to
+    /// change their pick before the match starts.
+    /// </summary>
+    public async Task SelectCharacter(string characterClass)
+    {
+        var result = _lobbies.SelectCharacter(Context.ConnectionId, characterClass);
+        if (!result.Success)
+            throw new HubException(result.Error ?? "Character selection rejected.");
+
+        _logger.LogInformation("Lobby: {Name} locked in {Char}", result.Player!.Name, characterClass);
+
+        await Clients.Group(GroupName(result.Snapshot!.ServerId)).SendAsync("CharacterSelected", result.Player);
+        await Clients.Group(GroupName(result.Snapshot.ServerId)).SendAsync("LobbyUpdated", result.Snapshot);
+    }
+
+    /// <summary>
+    /// Host-only: starts the actual match from char select (issue #34).
+    /// Requires all players locked in (minimum 2). Broadcasts
+    /// <c>MatchStarted</c> with the final roster + character classes, then
+    /// launches the game server.
+    /// </summary>
+    public async Task StartMatch()
+    {
+        var result = _lobbies.TryStartMatch(Context.ConnectionId);
+        if (!result.Success)
+            throw new HubException(result.Error ?? "Start match rejected.");
+
+        var config = result.Config!;
+        _logger.LogInformation("Lobby {ServerId}: host started the match ({Count} players)", config.ServerId, config.Players.Count);
+
+        await Clients.Group(GroupName(config.ServerId)).SendAsync("MatchStarted", config);
         await _launcher.LaunchAsync(config);
     }
 
