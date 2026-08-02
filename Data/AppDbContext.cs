@@ -53,6 +53,11 @@ public class AppDbContext : DbContext
         {
             entity.HasKey(e => e.Id);
             entity.HasIndex(e => e.Region);
+            // Issue #49: one row per socket — belt-and-braces behind the register
+            // upsert, so two processes can never claim the same ip:port. Not a
+            // unique index on IpAddress alone: that would block multiple
+            // legitimate servers behind one NAT or on one official host.
+            entity.HasIndex(e => new { e.IpAddress, e.Port }).IsUnique();
             entity.Property(e => e.Name).HasMaxLength(128).IsRequired();
             entity.Property(e => e.IpAddress).HasMaxLength(45).IsRequired();
             entity.Property(e => e.Region).HasMaxLength(16).IsRequired();

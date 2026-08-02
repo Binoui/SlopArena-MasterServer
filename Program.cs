@@ -91,6 +91,10 @@ var logger = app.Services.GetRequiredService<ILogger<Program>>();
 app.MapGet("/health", () => new { status = "ok", version = "0.1.0" });
 
 // ── Rate limiting middleware ──
+// Configurable (RateLimit:MaxRequestsPerWindow) so integration tests can raise
+// the per-IP POST budget; production default stays 10.
+var rateLimitMax = builder.Configuration.GetValue("RateLimit:MaxRequestsPerWindow", 10);
+
 app.Use(async (context, next) =>
 {
     // Only rate-limit POST endpoints
@@ -104,7 +108,7 @@ app.Use(async (context, next) =>
         var windowKey = $"{key}:{windowStart}";
 
         var current = RateLimitTracker.Increment(windowKey, ip);
-        if (current > 10)
+        if (current > rateLimitMax)
         {
             logger.LogWarning("Rate limit exceeded for {Ip} ({Count} requests in 10s window)", ip, current);
             context.Response.StatusCode = 429;
@@ -252,6 +256,39 @@ app.MapPost("/servers/register", async (
 
     var apiToken = Guid.NewGuid().ToString();
 
+    // Shared refresh path for both the lookup upsert and the lost-registration
+    // race below (issue #49).
+    async Task<IResult> Refresh(MasterServer.Data.Models.GameServer target)
+    {
+        target.Name = request.Name;
+        target.Region = request.Region;
+        target.IsOfficial = request.IsOfficial;
+        target.MaxConcurrentMatches = request.MaxConcurrentMatches;
+        target.CurrentMatches = 0;
+        target.CustomRulesJson = request.CustomRulesJson;
+        target.ApiToken = apiToken; // rotate: the previous process is gone
+        target.LastHeartbeat = DateTime.UtcNow;
+
+        await db.SaveChangesAsync();
+
+        logger.LogInformation("Game server re-registered (same IP:port): {Name} (ID: {Id}, IP: {Ip}, Region: {Region})",
+            target.Name, target.Id, target.IpAddress, target.Region);
+
+        return Results.Ok(new { serverId = target.Id, apiToken = apiToken });
+    }
+
+    // Upsert (issue #49): re-registering the same ip:port reclaims the existing
+    // row instead of inserting a duplicate. Prevents the browser showing two
+    // servers from one host when a game server restarts within the heartbeat
+    // TTL window. (IpAddress alone must NOT be the key — multiple legitimate
+    // servers can share an IP behind NAT or on one official host; the port
+    // disambiguates them.)
+    var existing = await db.GameServers.FirstOrDefaultAsync(s =>
+        s.IpAddress == request.IpAddress && s.Port == request.Port);
+
+    if (existing is not null)
+        return await Refresh(existing);
+
     var gameServer = new MasterServer.Data.Models.GameServer
     {
         Id = Guid.NewGuid(),
@@ -268,7 +305,21 @@ app.MapPost("/servers/register", async (
     };
 
     db.GameServers.Add(gameServer);
-    await db.SaveChangesAsync();
+
+    try
+    {
+        await db.SaveChangesAsync();
+    }
+    catch (DbUpdateException)
+    {
+        // Lost a registration race on the same fresh ip:port: the unique index
+        // rejected our insert, so reclaim the winner's row instead of a 500.
+        var winner = await db.GameServers.FirstOrDefaultAsync(s =>
+            s.IpAddress == request.IpAddress && s.Port == request.Port);
+        if (winner is null)
+            throw; // row gone concurrently; surface the original failure
+        return await Refresh(winner);
+    }
 
     logger.LogInformation("Game server registered: {Name} (ID: {Id}, IP: {Ip}, Region: {Region})",
         gameServer.Name, gameServer.Id, gameServer.IpAddress, gameServer.Region);
@@ -309,6 +360,39 @@ app.MapPost("/servers/{serverId}/heartbeat", async (
     await db.SaveChangesAsync();
 
     return Results.Ok(new { status = "ok" });
+});
+
+// ── Server deregister endpoint (issue #49) ──
+// Removes the calling server's row so it disappears from GET /servers
+// immediately instead of lingering for the heartbeat TTL window. Authenticated
+// by the server's apiToken (same bearer scheme as the heartbeat).
+app.MapDelete("/servers/{serverId}", async (
+    Guid serverId,
+    HttpContext httpContext,
+    AppDbContext db) =>
+{
+    var token = ExtractBearerToken(httpContext, logger);
+    if (token == null)
+        return Results.Unauthorized();
+
+    var server = await db.GameServers.FindAsync(serverId);
+    if (server == null)
+    {
+        logger.LogWarning("Deregister from unknown server: {ServerId}", serverId);
+        return Results.NotFound(new { error = "Server not found" });
+    }
+
+    if (!TimingSafeEquals(server.ApiToken, token))
+    {
+        logger.LogWarning("Deregister auth failed for server {ServerId}", serverId);
+        return Results.Unauthorized();
+    }
+
+    db.GameServers.Remove(server);
+    await db.SaveChangesAsync();
+
+    logger.LogInformation("Game server deregistered: {Name} (ID: {ServerId})", server.Name, server.Id);
+    return Results.Ok(new { status = "deregistered" });
 });
 
 // ── Server browser list endpoint (issue #31) ──

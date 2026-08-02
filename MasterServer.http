@@ -17,3 +17,36 @@ Accept: application/json
 GET {{MasterServer_HostAddress}}/servers
 Authorization: Bearer {{jwt}}
 Accept: application/json
+
+###
+
+# Game server registration (upsert on ip:port) — returns serverId + apiToken
+POST {{MasterServer_HostAddress}}/servers/register
+Content-Type: application/json
+
+{
+  "name": "My Server",
+  "ipAddress": "127.0.0.1",
+  "port": 9876,
+  "region": "EU",
+  "isOfficial": false,
+  "maxConcurrentMatches": 15
+}
+
+###
+
+# Game server heartbeat (Bearer = apiToken from register)
+POST {{MasterServer_HostAddress}}/servers/{{serverId}}/heartbeat
+Authorization: Bearer {{apiToken}}
+Content-Type: application/json
+
+{
+  "currentMatches": 0
+}
+
+###
+
+# Game server deregister on shutdown (Bearer = apiToken from register)
+DELETE {{MasterServer_HostAddress}}/servers/{{serverId}}
+Authorization: Bearer {{apiToken}}
+Accept: application/json
