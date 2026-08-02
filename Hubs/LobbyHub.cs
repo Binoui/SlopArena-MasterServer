@@ -47,6 +47,11 @@ public sealed class LobbyHub : Hub
 
         var result = _lobbies.JoinLobby(serverId, Context.ConnectionId, steamId, user.Username);
 
+        // Rejected joins (e.g. lobby at capacity, issue #6) surface as a
+        // HubException before any group membership or broadcast happens.
+        if (!result.Success)
+            throw new HubException(result.Error ?? "Join rejected.");
+
         // If the connection was previously in a different lobby, announce the
         // departure to the old lobby's survivors and drop the old group membership.
         if (result.Departure is { } dep)
@@ -56,8 +61,8 @@ public sealed class LobbyHub : Hub
 
         _logger.LogInformation("Lobby {ServerId}: {Name} ({SteamId}) joined", serverId, user.Username, steamId);
 
-        await Clients.Group(GroupName(serverId)).SendAsync("PlayerJoined", result.Player);
-        await Clients.Group(GroupName(serverId)).SendAsync("LobbyUpdated", result.Snapshot);
+        await Clients.Group(GroupName(serverId)).SendAsync("PlayerJoined", result.Player!);
+        await Clients.Group(GroupName(serverId)).SendAsync("LobbyUpdated", result.Snapshot!);
     }
 
     /// <summary>Leave the current lobby.</summary>

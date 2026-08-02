@@ -425,4 +425,29 @@ public class LobbyHubTests
 
         await Assert.ThrowsAsync<HubException>(() => hub1.StartMatch());
     }
+
+    [Fact]
+    public async Task JoinLobby_FullLobby_Throws_HubException()
+    {
+        // Issue #6: a fifth player joining a full (4-player) lobby is rejected
+        // with a HubException and nothing is broadcast or group-added for them.
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        for (int i = 0; i < 4; i++)
+        {
+            var h = harness.CreateHub($"c{i}", 100 + i, $"P{i}");
+            await h.JoinLobby(ServerId);
+        }
+        var fifth = harness.CreateHub("c4", 505, "Eve");
+
+        await Assert.ThrowsAsync<HubException>(() => fifth.JoinLobby(ServerId));
+
+        // Exactly 4 PlayerJoined broadcasts — the rejected join adds none.
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("PlayerJoined", It.IsAny<object[]>(), default),
+            Times.Exactly(4));
+        harness.Groups.Verify(
+            g => g.AddToGroupAsync("c4", GroupName(ServerId), default),
+            Times.Never);
+    }
 }

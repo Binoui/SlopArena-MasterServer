@@ -63,6 +63,20 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     });
 
 // ── Lobby services (issue #32) ──
+// Lobby capacity (issue #6): max players per lobby from configuration,
+// defaulting to 4. Registered once so the manager and the launcher share it.
+builder.Services.AddSingleton(_ =>
+{
+    var max = builder.Configuration.GetValue("Lobby:MaxPlayersPerLobby", LobbyLimits.MaxPlayers);
+    // The persisted Match row holds exactly Player1–Player4, so the config can
+    // lower the default but never raise it — else the roster/row divergence
+    // this issue exists to prevent would come back (issue #6).
+    if (max is < LobbyLimits.MinPlayers or > LobbyLimits.MaxPlayers)
+        throw new InvalidOperationException(
+            $"Lobby:MaxPlayersPerLobby must be between {LobbyLimits.MinPlayers} and " +
+            $"{LobbyLimits.MaxPlayers} (the persisted Match capacity).");
+    return new LobbyOptions(max);
+});
 builder.Services.AddSingleton<LobbyManager>();
 // Scoped: HttpMatchLauncher consumes the scoped AppDbContext to look up the
 // game server's IP + port before POSTing the match-start command (issue #35).

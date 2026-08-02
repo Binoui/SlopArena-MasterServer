@@ -42,13 +42,16 @@ public sealed class HttpMatchLauncher : IMatchLauncher
     private readonly AppDbContext _db;
     private readonly HttpClient _http;
     private readonly ILogger<HttpMatchLauncher> _logger;
+    private readonly int _maxPlayersPerLobby;
 
     /// <param name="http">Managed <see cref="HttpClient"/> from <c>AddHttpClient</c>; reused across scopes to avoid socket exhaustion.</param>
-    public HttpMatchLauncher(AppDbContext db, ILogger<HttpMatchLauncher> logger, HttpClient http)
+    /// <param name="options">Lobby capacity options (issue #6); defaults to 4 per lobby.</param>
+    public HttpMatchLauncher(AppDbContext db, ILogger<HttpMatchLauncher> logger, HttpClient http, LobbyOptions? options = null)
     {
         _db = db;
         _logger = logger;
         _http = http;
+        _maxPlayersPerLobby = LobbyOptions.ResolveMax(options);
         _http.Timeout = TimeSpan.FromSeconds(5);
     }
 
@@ -63,6 +66,16 @@ public sealed class HttpMatchLauncher : IMatchLauncher
         var matchGuid = Guid.NewGuid();
         var matchId = matchGuid.ToString();
         var players = config.Players;
+
+        // The persisted Match row fits exactly 2–4 players — reject anything
+        // else before creating the row or POSTing, so the roster and the row
+        // can never diverge (issue #6).
+        if (players.Count < LobbyLimits.MinPlayers || players.Count > _maxPlayersPerLobby)
+        {
+            throw new InvalidOperationException(
+                $"Cannot launch match with {players.Count} players " +
+                $"(expected {LobbyLimits.MinPlayers}–{_maxPlayersPerLobby}).");
+        }
 
         // Create the Match row up front so the game server's later
         // POST /match/result finds it (issue #40). Rolled back on launch failure.

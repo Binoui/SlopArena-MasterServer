@@ -77,6 +77,11 @@ public class HttpMatchLauncherTests
         new LobbyPlayer(202, "Bob", "FightGuy", true, false, 2),
     };
 
+    /// <summary>A roster of <paramref name="count"/> locked-in players with 1-based entity IDs.</summary>
+    private static List<LobbyPlayer> Roster(int count) => Enumerable.Range(1, count)
+        .Select(i => new LobbyPlayer(100L + i, $"P{i}", "Manki", true, i == 1, i))
+        .ToList();
+
     [Fact]
     public async Task LaunchAsync_PostsRosterWithClassesAndEntityIds()
     {
@@ -174,5 +179,56 @@ public class HttpMatchLauncherTests
 
         await Assert.ThrowsAsync<HttpRequestException>(() => launcher.LaunchAsync(config));
         Assert.Empty(db.Matches);
+    }
+
+    // ── Player-count contract (issue #6): the roster must fit the persisted Match ──
+
+    [Fact]
+    public async Task LaunchAsync_TooManyPlayers_Throws_BeforePersistOrPost()
+    {
+        var handler = new StubHandler();
+        var db = SeedServer("127.0.0.1", 9876);
+        var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
+
+        var config = new MatchStartedConfig(ServerId, Roster(5));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => launcher.LaunchAsync(config));
+
+        // No Match row and no HTTP call to the game server.
+        Assert.Empty(db.Matches);
+        Assert.Null(handler.RequestUri);
+    }
+
+    [Fact]
+    public async Task LaunchAsync_SinglePlayer_Throws_BeforePersistOrPost()
+    {
+        var handler = new StubHandler();
+        var db = SeedServer("127.0.0.1", 9876);
+        var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
+
+        var config = new MatchStartedConfig(ServerId, Roster(1));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => launcher.LaunchAsync(config));
+
+        Assert.Empty(db.Matches);
+        Assert.Null(handler.RequestUri);
+    }
+
+    [Fact]
+    public async Task LaunchAsync_FourPlayers_PersistsP3P4_AndPosts()
+    {
+        var handler = new StubHandler();
+        var db = SeedServer("127.0.0.1", 9876);
+        var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
+
+        var config = new MatchStartedConfig(ServerId, Roster(4));
+        int port = await launcher.LaunchAsync(config);
+
+        Assert.Equal(9877, port);
+        var match = Assert.Single(db.Matches);
+        Assert.NotNull(match.Player3SteamId);
+        Assert.NotNull(match.Player4SteamId);
+        var body = System.Text.Json.JsonDocument.Parse(handler.RequestBody);
+        Assert.Equal(4, body.RootElement.GetProperty("players").GetArrayLength());
     }
 }

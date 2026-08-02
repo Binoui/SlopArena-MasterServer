@@ -12,6 +12,13 @@ public sealed class LobbyManager
 {
     private readonly ConcurrentDictionary<Guid, Lobby> _lobbiesByServer = new();
     private readonly ConcurrentDictionary<string, Lobby> _lobbyByConnection = new();
+    private readonly int _maxPlayersPerLobby;
+
+    /// <param name="options">Lobby capacity options (issue #6); defaults to 4 per lobby.</param>
+    public LobbyManager(LobbyOptions? options = null)
+    {
+        _maxPlayersPerLobby = LobbyOptions.ResolveMax(options);
+    }
 
     /// <summary>
     /// Adds a player to the lobby for <paramref name="serverId"/>. The first
@@ -19,25 +26,27 @@ public sealed class LobbyManager
     /// </summary>
     public JoinLobbyResult JoinLobby(Guid serverId, string connectionId, long steamId, string name)
     {
-        var lobby = _lobbiesByServer.GetOrAdd(serverId, _ => new Lobby(serverId));
+        var lobby = _lobbiesByServer.GetOrAdd(serverId, _ => new Lobby(serverId, _maxPlayersPerLobby));
 
-        // A connection can only be in one lobby at a time. If it was previously
-        // in a *different* lobby, remove it there and surface the departure so
-        // the hub can broadcast PlayerLeft to the old lobby's survivors and drop
-        // the old SignalR group membership. If it was already in THIS lobby
-        // (same server, e.g. a duplicate join), return the current snapshot
-        // without removing/re-adding — avoids orphaning the lobby.
+        // Already in this lobby (duplicate join) — return current state without
+        // removing/re-adding to avoid a duplicate member.
+        if (_lobbyByConnection.TryGetValue(connectionId, out var previous) && previous == lobby)
+            return new JoinLobbyResult(true, null, lobby.GetPlayer(connectionId), lobby.Snapshot(), null);
+
+        // Capacity is enforced atomically under the lobby lock, so concurrent
+        // joins cannot oversubscribe. A rejected join leaves the connection
+        // wherever it was (issue #6).
+        var joined = lobby.AddPlayer(connectionId, steamId, name);
+        if (joined is null)
+            return new JoinLobbyResult(false,
+                $"Lobby is full (max {_maxPlayersPerLobby} players).", null, null, null);
+
+        // The join succeeded — drop any prior membership in a different lobby
+        // and surface the departure so the hub can announce it to the old
+        // lobby's survivors and drop the old SignalR group membership.
         LeaveLobbyResult? departure = null;
-        if (_lobbyByConnection.TryGetValue(connectionId, out var previous))
+        if (previous is not null)
         {
-            if (previous == lobby)
-            {
-                // Already in this lobby (duplicate join) — return current state
-                // without removing/re-adding to avoid a duplicate member.
-                return new JoinLobbyResult(lobby.GetPlayer(connectionId)!, lobby.Snapshot(), null);
-            }
-
-            // Different lobby — remove from the old one and surface the departure.
             var player = previous.RemovePlayer(connectionId);
             if (previous.IsEmpty)
                 _lobbiesByServer.TryRemove(previous.ServerId, out _);
@@ -45,9 +54,7 @@ public sealed class LobbyManager
         }
 
         _lobbyByConnection[connectionId] = lobby;
-
-        var joined = lobby.AddPlayer(connectionId, steamId, name);
-        return new JoinLobbyResult(joined, lobby.Snapshot(), departure);
+        return new JoinLobbyResult(true, null, joined, lobby.Snapshot(), departure);
     }
 
     /// <summary>
@@ -137,17 +144,24 @@ public sealed class LobbyManager
     /// A single lobby: an ordered, locked player list. The first member is the
     /// host; on host departure the next-joined member is promoted.
     /// </summary>
-    private sealed class Lobby(Guid serverId)
+    private sealed class Lobby(Guid serverId, int maxPlayers)
     {
         private readonly object _gate = new();
         private readonly List<Member> _members = new();
 
         public Guid ServerId => serverId;
 
-        public LobbyPlayer AddPlayer(string connectionId, long steamId, string name)
+        /// <summary>
+        /// Adds a player as the newest member. Returns null when the lobby is
+        /// at capacity (issue #6) — the caller must treat that as a rejection.
+        /// </summary>
+        public LobbyPlayer? AddPlayer(string connectionId, long steamId, string name)
         {
             lock (_gate)
             {
+                if (_members.Count >= maxPlayers)
+                    return null;
+
                 var isHost = _members.Count == 0;
                 var member = new Member(connectionId, steamId, name, null, false, isHost);
                 _members.Add(member);
@@ -238,15 +252,15 @@ public sealed class LobbyManager
 
         /// <summary>
         /// Checks whether all members have locked in a character. Returns false
-        /// with a descriptive error if not. Minimum 2 players required.
+        /// with a descriptive error if not. Minimum 2 players required (issue #6).
         /// </summary>
         public bool IsAllLockedIn(out string? error)
         {
             lock (_gate)
             {
-                if (_members.Count < 2)
+                if (_members.Count < LobbyLimits.MinPlayers)
                 {
-                    error = "Need at least 2 players to start.";
+                    error = $"Need at least {LobbyLimits.MinPlayers} players to start.";
                     return false;
                 }
 

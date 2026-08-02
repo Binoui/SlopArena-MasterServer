@@ -41,10 +41,14 @@ public sealed record MatchStartedConfig(
 /// SignalR group join and the <c>PlayerJoined</c>/<c>LobbyUpdated</c> broadcasts.
 /// <c>Departure</c> is non-null when the connection was previously in a
 /// different lobby — the hub must announce the departure to the old lobby.
+/// <c>Success</c> is false (with <c>Error</c>) when the join was rejected,
+/// e.g. the lobby is at capacity (issue #6); Player/Snapshot are null then.
 /// </summary>
 public sealed record JoinLobbyResult(
-    LobbyPlayer Player,
-    LobbySnapshot Snapshot,
+    bool Success,
+    string? Error,
+    LobbyPlayer? Player,
+    LobbySnapshot? Snapshot,
     LeaveLobbyResult? Departure);
 
 /// <summary>
