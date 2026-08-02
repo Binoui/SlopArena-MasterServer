@@ -21,7 +21,7 @@ public class LobbyManagerTests
         var result = mgr.JoinLobby(ServerA, "c1", 101, "Alice");
 
         Assert.True(result.Player!.IsHost);
-        Assert.Equal("Alice", result.Player!.Name);
+        Assert.Equal("Alice", result.Player!.Username);
         Assert.Equal(101, result.Player!.SteamId);
         Assert.Single(result.Snapshot!.Players);
         Assert.Equal(ServerA, result.Snapshot!.ServerId);
@@ -265,7 +265,7 @@ public class LobbyManagerTests
 
         Assert.True(result.Success);
         Assert.NotNull(result.Player);
-        Assert.Equal("Manki", result.Player!.CharacterSelection);
+        Assert.Equal("Manki", result.Player!.Character);
         Assert.True(result.Player!.LockedIn);
     }
 
@@ -294,7 +294,7 @@ public class LobbyManagerTests
         var result = mgr.SelectCharacter("c1", "FightGuy");
 
         Assert.True(result.Success);
-        Assert.Equal("FightGuy", result.Player!.CharacterSelection);
+        Assert.Equal("FightGuy", result.Player!.Character);
         Assert.True(result.Player!.LockedIn);
     }
 

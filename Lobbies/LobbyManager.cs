@@ -24,26 +24,26 @@ public sealed class LobbyManager
     /// Adds a player to the lobby for <paramref name="serverId"/>. The first
     /// player to join an empty lobby becomes the host (issue #32).
     /// </summary>
-    public JoinLobbyResult JoinLobby(Guid serverId, string connectionId, long steamId, string name)
+    public JoinLobbyResult JoinLobby(Guid serverId, string connectionId, long steamId, string username)
     {
         var lobby = _lobbiesByServer.GetOrAdd(serverId, _ => new Lobby(serverId, _maxPlayersPerLobby));
 
         // Already in this lobby (duplicate join) — return current state without
-        // removing/re-adding to avoid a duplicate member.
+        // removing/re-adding to avoid a duplicate player.
         if (_lobbyByConnection.TryGetValue(connectionId, out var previous) && previous == lobby)
             return new JoinLobbyResult(true, null, lobby.GetPlayer(connectionId), lobby.Snapshot(), null);
 
         // Capacity is enforced atomically under the lobby lock, so concurrent
         // joins cannot oversubscribe. A rejected join leaves the connection
         // wherever it was (issue #6).
-        var joined = lobby.AddPlayer(connectionId, steamId, name);
+        var joined = lobby.AddPlayer(connectionId, steamId, username);
         if (joined is null)
             return new JoinLobbyResult(false,
                 $"Lobby is full (max {_maxPlayersPerLobby} players).", null, null, null);
 
-        // The join succeeded — drop any prior membership in a different lobby
-        // and surface the departure so the hub can announce it to the old
-        // lobby's survivors and drop the old SignalR group membership.
+        // The join succeeded — depart any previous lobby and surface the departure
+        // so the hub can announce it to the old lobby's survivors and drop the
+        // old SignalR group membership.
         LeaveLobbyResult? departure = null;
         if (previous is not null)
         {
@@ -105,12 +105,12 @@ public sealed class LobbyManager
     /// starts. Returns the updated player + full snapshot for the
     /// <c>CharacterSelected</c> + <c>LobbyUpdated</c> broadcasts.
     /// </summary>
-    public SelectCharacterResult SelectCharacter(string connectionId, string characterClass)
+    public SelectCharacterResult SelectCharacter(string connectionId, string character)
     {
         if (!_lobbyByConnection.TryGetValue(connectionId, out var lobby))
             return new SelectCharacterResult(false, "You are not in a lobby.", null, null);
 
-        var (player, snapshot) = lobby.SelectCharacter(connectionId, characterClass);
+        var (player, snapshot) = lobby.SelectCharacter(connectionId, character);
         if (player is null)
             return new SelectCharacterResult(false, "You are not in a lobby.", null, null);
 
@@ -141,31 +141,31 @@ public sealed class LobbyManager
     }
 
     /// <summary>
-    /// A single lobby: an ordered, locked player list. The first member is the
-    /// host; on host departure the next-joined member is promoted.
+    /// A single lobby: an ordered, locked player list. The first player is the
+    /// host; on host departure the next-joined player is promoted.
     /// </summary>
     private sealed class Lobby(Guid serverId, int maxPlayers)
     {
         private readonly object _gate = new();
-        private readonly List<Member> _members = new();
+        private readonly List<PlayerState> _players = new();
 
         public Guid ServerId => serverId;
 
         /// <summary>
-        /// Adds a player as the newest member. Returns null when the lobby is
+        /// Adds a player as the newest player. Returns null when the lobby is
         /// at capacity (issue #6) — the caller must treat that as a rejection.
         /// </summary>
-        public LobbyPlayer? AddPlayer(string connectionId, long steamId, string name)
+        public LobbyPlayer? AddPlayer(string connectionId, long steamId, string username)
         {
             lock (_gate)
             {
-                if (_members.Count >= maxPlayers)
+                if (_players.Count >= maxPlayers)
                     return null;
 
-                var isHost = _members.Count == 0;
-                var member = new Member(connectionId, steamId, name, null, false, isHost);
-                _members.Add(member);
-                return member.ToPlayer();
+                var isHost = _players.Count == 0;
+                var player = new PlayerState(connectionId, steamId, username, null, false, isHost);
+                _players.Add(player);
+                return player.ToPlayer();
             }
         }
 
@@ -173,8 +173,8 @@ public sealed class LobbyManager
         {
             lock (_gate)
             {
-                var idx = _members.FindIndex(m => m.ConnectionId == connectionId);
-                return idx >= 0 ? _members[idx].ToPlayer() : null;
+                var idx = _players.FindIndex(m => m.ConnectionId == connectionId);
+                return idx >= 0 ? _players[idx].ToPlayer() : null;
             }
         }
 
@@ -182,15 +182,15 @@ public sealed class LobbyManager
         {
             lock (_gate)
             {
-                var idx = _members.FindIndex(m => m.ConnectionId == connectionId);
+                var idx = _players.FindIndex(m => m.ConnectionId == connectionId);
                 if (idx < 0) return null;
 
-                var removed = _members[idx];
-                _members.RemoveAt(idx);
+                var removed = _players[idx];
+                _players.RemoveAt(idx);
 
-                // Promote the now-first member to host when the host left.
-                if (removed.IsHost && _members.Count > 0)
-                    _members[0] = _members[0] with { IsHost = true };
+                // Promote the now-first player to host when the host left.
+                if (removed.IsHost && _players.Count > 0)
+                    _players[0] = _players[0] with { IsHost = true };
 
                 return removed.ToPlayer();
             }
@@ -200,7 +200,7 @@ public sealed class LobbyManager
         {
             get
             {
-                lock (_gate) { return _members.Count == 0; }
+                lock (_gate) { return _players.Count == 0; }
             }
         }
 
@@ -208,13 +208,13 @@ public sealed class LobbyManager
         {
             lock (_gate)
             {
-                var idx = _members.FindIndex(m => m.ConnectionId == connectionId);
-                if (idx < 0 || !_members[idx].IsHost)
+                var idx = _players.FindIndex(m => m.ConnectionId == connectionId);
+                if (idx < 0 || !_players[idx].IsHost)
                 {
                     host = null;
                     return false;
                 }
-                host = _members[idx].ToPlayer();
+                host = _players[idx].ToPlayer();
                 return true;
             }
         }
@@ -223,51 +223,51 @@ public sealed class LobbyManager
         {
             lock (_gate)
             {
-                return new LobbySnapshot(serverId, _members.Select(m => m.ToPlayer()).ToList());
+                return new LobbySnapshot(serverId, _players.Select(m => m.ToPlayer()).ToList());
             }
         }
 
         /// <summary>
-        /// Locks in a character selection for the member on this connection
+        /// Locks in a character selection for the player on this connection
         /// (issue #34). Returns the updated player + snapshot, or null player
         /// if the connection is not in this lobby.
         /// </summary>
         public (LobbyPlayer? Player, LobbySnapshot Snapshot) SelectCharacter(
-            string connectionId, string characterClass)
+            string connectionId, string character)
         {
             lock (_gate)
             {
-                var idx = _members.FindIndex(m => m.ConnectionId == connectionId);
+                var idx = _players.FindIndex(m => m.ConnectionId == connectionId);
                 if (idx < 0)
                     return (null, Snapshot());
 
-                _members[idx] = _members[idx] with
+                _players[idx] = _players[idx] with
                 {
-                    CharacterSelection = characterClass,
+                    Character = character,
                     LockedIn = true
                 };
-                return (_members[idx].ToPlayer(), Snapshot());
+                return (_players[idx].ToPlayer(), Snapshot());
             }
         }
 
         /// <summary>
-        /// Checks whether all members have locked in a character. Returns false
+        /// Checks whether all players have locked in a character. Returns false
         /// with a descriptive error if not. Minimum 2 players required (issue #6).
         /// </summary>
         public bool IsAllLockedIn(out string? error)
         {
             lock (_gate)
             {
-                if (_members.Count < LobbyLimits.MinPlayers)
+                if (_players.Count < LobbyLimits.MinPlayers)
                 {
                     error = $"Need at least {LobbyLimits.MinPlayers} players to start.";
                     return false;
                 }
 
-                var unlocked = _members.FirstOrDefault(m => !m.LockedIn);
+                var unlocked = _players.FirstOrDefault(m => !m.LockedIn);
                 if (unlocked != default)
                 {
-                    error = $"Waiting for {unlocked.Name} to lock in.";
+                    error = $"Waiting for {unlocked.Username} to lock in.";
                     return false;
                 }
 
@@ -276,16 +276,16 @@ public sealed class LobbyManager
             }
         }
 
-        private readonly record struct Member(
+        private readonly record struct PlayerState(
             string ConnectionId,
             long SteamId,
-            string Name,
-            string? CharacterSelection,
+            string Username,
+            string? Character,
             bool LockedIn,
             bool IsHost,
             int EntityId = 0)
         {
-            public LobbyPlayer ToPlayer() => new(SteamId, Name, CharacterSelection, LockedIn, IsHost, EntityId);
+            public LobbyPlayer ToPlayer() => new(SteamId, Username, Character, LockedIn, IsHost, EntityId);
         }
     }
 }

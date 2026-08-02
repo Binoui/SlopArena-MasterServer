@@ -30,7 +30,7 @@ public interface IMatchLauncher
 /// The game server runs a tiny HTTP control listener (System.Net.HttpListener on
 /// the registered base port) exposing <c>POST /match/start</c>. The master server
 /// looks up the game server's IP + port from the registration record, sends the
-/// roster (steamId + locked-in characterClass + assigned entityId), and reads back
+/// roster (steamId + locked-in character + assigned entityId), and reads back
 /// the match port. This keeps the game server stateless between matches (ADR-0008,
 /// see docs/adr/), and matches the existing game→master result report (also HTTP).
 /// </summary>
@@ -99,7 +99,9 @@ public sealed class HttpMatchLauncher : IMatchLauncher
                 .Select(p => new
                 {
                     steamId = p.SteamId,
-                    characterClass = p.CharacterSelection,
+                    // Wire key stays `characterClass` — the game server's
+                    // MatchStartRequestCodec reads it verbatim (issue #7).
+                    characterClass = p.Character,
                     entityId = p.EntityId,
                 })
                 .ToArray(),

@@ -1,14 +1,23 @@
 // MasterServer/Lobbies/LobbyModels.cs
+using System.Text.Json.Serialization;
+
 namespace MasterServer.Lobbies;
 
 /// <summary>
 /// A player present in a lobby. Lobby state is in-memory and ephemeral
 /// (see ADR-0004, docs/adr/): the master server is the lobby authority only while up.
 /// </summary>
+/// <remarks>
+/// Glossary alignment (issue #7): the C# properties are <c>Username</c>/<c>Character</c>,
+/// but the SignalR wire keys stay <c>name</c>/<c>characterSelection</c> (pinned via
+/// <see cref="JsonPropertyNameAttribute"/>). The client (SlopArena repo) parses those
+/// exact keys in <c>LobbyPayloadCodec</c>, so the wire cannot change until both repos
+/// ship in lockstep.
+/// </remarks>
 public sealed record LobbyPlayer(
     long SteamId,
-    string Name,
-    string? CharacterSelection,
+    [property: JsonPropertyName("name")] string Username,
+    [property: JsonPropertyName("characterSelection")] string? Character,
     bool LockedIn,
     bool IsHost,
     int EntityId = 0);
@@ -27,7 +36,7 @@ public sealed record MatchStartingConfig(Guid ServerId, IReadOnlyList<LobbyPlaye
 
 /// Payload of the <c>MatchStarted</c> push broadcast when the host starts the
 /// actual match from char select (all players locked in). Carries the final
-/// roster with character classes + entity IDs, the UDP port the game server
+/// roster with characters + entity IDs, the UDP port the game server
 /// assigned to the match, and the arena the game server loaded (issue #35).
 /// </summary>
 public sealed record MatchStartedConfig(

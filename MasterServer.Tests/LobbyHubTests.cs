@@ -378,8 +378,8 @@ public class LobbyHubTests
               && c.Players.Count == 2
               && c.Players[0].EntityId == 1
               && c.Players[1].EntityId == 2
-              && c.Players[0].CharacterSelection == "Manki"
-              && c.Players[1].CharacterSelection == "FightGuy")), Times.Once);
+              && c.Players[0].Character == "Manki"
+              && c.Players[1].Character == "FightGuy")), Times.Once);
     }
 
     [Fact]
@@ -449,5 +449,30 @@ public class LobbyHubTests
         harness.Groups.Verify(
             g => g.AddToGroupAsync("c4", GroupName(ServerId), default),
             Times.Never);
+    }
+
+    [Fact]
+    public void LobbyPlayer_WireKeys_Pinned_ForClientCodec()
+    {
+        // Issue #7: the C# properties are Username/Character, but the wire keys
+        // must stay `name`/`characterSelection` — the client (SlopArena repo)
+        // parses those exact keys in LobbyPayloadCodec. Serialize with the same
+        // camelCase policy SignalR's JSON hub protocol uses.
+        var player = new LobbyPlayer(101, "Alice", "Manki", true, true, 1);
+
+        var json = System.Text.Json.JsonSerializer.Serialize(
+            player,
+            new System.Text.Json.JsonSerializerOptions
+            {
+                PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase
+            });
+
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        Assert.Equal("Alice", doc.RootElement.GetProperty("name").GetString());
+        Assert.Equal("Manki", doc.RootElement.GetProperty("characterSelection").GetString());
+        Assert.Equal(101, doc.RootElement.GetProperty("steamId").GetInt64());
+        Assert.True(doc.RootElement.GetProperty("lockedIn").GetBoolean());
+        Assert.True(doc.RootElement.GetProperty("isHost").GetBoolean());
+        Assert.Equal(1, doc.RootElement.GetProperty("entityId").GetInt32());
     }
 }

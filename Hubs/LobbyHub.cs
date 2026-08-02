@@ -59,7 +59,7 @@ public sealed class LobbyHub : Hub
 
         await Groups.AddToGroupAsync(Context.ConnectionId, GroupName(serverId));
 
-        _logger.LogInformation("Lobby {ServerId}: {Name} ({SteamId}) joined", serverId, user.Username, steamId);
+        _logger.LogInformation("Lobby {ServerId}: {Username} ({SteamId}) joined", serverId, user.Username, steamId);
 
         await Clients.Group(GroupName(serverId)).SendAsync("PlayerJoined", result.Player!);
         await Clients.Group(GroupName(serverId)).SendAsync("LobbyUpdated", result.Snapshot!);
@@ -99,13 +99,13 @@ public sealed class LobbyHub : Hub
     /// (full snapshot) to all lobby members. A player may call this again to
     /// change their pick before the match starts.
     /// </summary>
-    public async Task SelectCharacter(string characterClass)
+    public async Task SelectCharacter(string character)
     {
-        var result = _lobbies.SelectCharacter(Context.ConnectionId, characterClass);
+        var result = _lobbies.SelectCharacter(Context.ConnectionId, character);
         if (!result.Success)
             throw new HubException(result.Error ?? "Character selection rejected.");
 
-        _logger.LogInformation("Lobby: {Name} locked in {Char}", result.Player!.Name, characterClass);
+        _logger.LogInformation("Lobby: {Username} locked in {Character}", result.Player!.Username, character);
 
         await Clients.Group(GroupName(result.Snapshot!.ServerId)).SendAsync("CharacterSelected", result.Player);
         await Clients.Group(GroupName(result.Snapshot.ServerId)).SendAsync("LobbyUpdated", result.Snapshot);
@@ -114,7 +114,7 @@ public sealed class LobbyHub : Hub
     /// <summary>
     /// Host-only: starts the actual match from char select (issue #34/#35).
     /// Requires all players locked in (minimum 2). Launches the game server
-    /// (HTTP match-start with the roster + entity IDs + character classes),
+    /// (HTTP match-start with the roster + entity IDs + characters),
     /// then broadcasts <c>MatchStarted</c> carrying the assigned UDP port +
     /// arena so every client can connect and load the right scene.
     /// </summary>
@@ -149,7 +149,7 @@ public sealed class LobbyHub : Hub
             return; // was not in a lobby
 
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, GroupName(serverId.Value));
-        _logger.LogInformation("Lobby {ServerId}: {Name} ({SteamId}) left", serverId, player.Name, player.SteamId);
+        _logger.LogInformation("Lobby {ServerId}: {Username} ({SteamId}) left", serverId, player.Username, player.SteamId);
 
         // No snapshot means the lobby is now empty — nothing to broadcast.
         if (snapshot is null)
