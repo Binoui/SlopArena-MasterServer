@@ -1,6 +1,22 @@
 # SlopArena Master Server
 
-Backend API for SlopArena — matchmaking, player accounts, and game server registration.
+Backend API for SlopArena — game server registration, the server browser, and SignalR lobbies.
+Matchmaking is planned but **not yet implemented**; the server browser is the current entry point.
+
+## Scope
+
+Runs the SlopArena pre-match flow: players self-select a fresh, non-full game server from the
+browser, join its lobby, and the host starts the match. No matchmaking exists yet — there is no
+queue, no pairing, and no skill/MMR matching (`User.Mmr` is stored but never used).
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /auth/guest`, `GET /auth/me` | Guest JWT auth and player info (player accounts) |
+| `POST /servers/register` | Game server registration (IP, port, region, capacity) |
+| `POST /servers/{id}/heartbeat` | Game server liveness + load report |
+| `GET /servers` | Server browser: heartbeat-fresh, non-full game servers |
+| `POST /match/result` | Match result reporting (roster, winner) |
+| `/lobby` (SignalR) | Per-game-server lobbies: join/leave, host start, character select, match launch |
 
 ## Tech Stack
 
@@ -47,8 +63,10 @@ dotnet run
 
 ```
 SlopArena-MasterServer/
-├── Data/           # EF Core DbContext + migrations
+├── Data/           # EF Core DbContext + migrations + models
 ├── DTOs/           # API request/response models
+├── Hubs/           # SignalR LobbyHub (per-server lobby flow)
+├── Lobbies/        # LobbyManager (in-memory lobby authority) + HTTP match launcher
 ├── Program.cs      # ASP.NET entry point
 └── appsettings.json
 ```
