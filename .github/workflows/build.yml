@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
 
@@ -34,3 +35,56 @@ jobs:
 
       - name: Build
         run: dotnet build --no-restore --verbosity minimal
+
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Configure GitHub Packages
+        run: dotnet nuget add source --username Binoui --password ${{ secrets.GITHUB_TOKEN }} --store-password-in-clear-text --name github "https://nuget.pkg.github.com/Binoui/index.json"
+
+      - name: Remove local dev feed (CI-only)
+        run: dotnet nuget remove source local-sloparena
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Test
+        run: dotnet test --no-restore --verbosity minimal
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Configure GitHub Packages
+        run: dotnet nuget add source --username Binoui --password ${{ secrets.GITHUB_TOKEN }} --store-password-in-clear-text --name github "https://nuget.pkg.github.com/Binoui/index.json"
+
+      - name: Remove local dev feed (CI-only)
+        run: dotnet nuget remove source local-sloparena
+
+      - name: Publish
+        run: dotnet publish -c Release -o publish --no-restore --verbosity minimal
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: master-server
+          path: publish/

@@ -83,6 +83,7 @@ builder.Services.AddSingleton<LobbyManager>();
 // AddHttpClient gives the launcher a managed, pooled HttpClient (avoids socket
 // exhaustion from per-scope `new HttpClient()` — issue #35 review).
 builder.Services.AddHttpClient<IMatchLauncher, HttpMatchLauncher>();
+builder.Services.AddSingleton<RateLimitTracker>();
 builder.Services.AddAuthorization();
 
 var app = builder.Build();
@@ -107,7 +108,8 @@ app.Use(async (context, next) =>
         var windowStart = now / 10; // 10-second window
         var windowKey = $"{key}:{windowStart}";
 
-        var current = RateLimitTracker.Increment(windowKey, ip);
+        var tracker = context.RequestServices.GetRequiredService<RateLimitTracker>();
+        var current = tracker.Increment(windowKey, ip);
         if (current > rateLimitMax)
         {
             logger.LogWarning("Rate limit exceeded for {Ip} ({Count} requests in 10s window)", ip, current);
@@ -159,11 +161,14 @@ static bool TimingSafeEquals(string a, string b)
         System.Text.Encoding.UTF8.GetBytes(b));
 }
 
-// ── Helper: validate IP address format ──
+// ── Helper: validate server address (IP literal or DNS hostname) ──
 static bool IsValidIpAddress(string ip)
 {
-    return IPAddress.TryParse(ip, out var addr) &&
-           addr.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork; // IPv4 only for now
+    // IPv4 literal, or a DNS hostname (domain allowed — ADR-0009: official
+    // servers behind NAT register with a public domain like
+    // sloparena.barakaslurp.fr; clients and the match launcher both resolve it).
+    // IPv6 not yet supported.
+    return Uri.CheckHostName(ip) is UriHostNameType.IPv4 or UriHostNameType.Dns;
 }
 
 // ── Helper: validate port range ──
@@ -482,13 +487,17 @@ public partial class Program { }
 /// <summary>
 /// Simple in-memory rate limit tracker with auto-cleanup.
 /// Thread-safe via ConcurrentDictionary.
+/// Registered as a singleton so each app instance (each test factory, or the
+/// one production process) gets its own counters — a static class here would
+/// make parallel integration-test factories share one bucket and trip false
+/// 429s (observed in the full test suite).
 /// </summary>
-internal static class RateLimitTracker
+internal sealed class RateLimitTracker
 {
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _counts = new();
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _lastCleanup = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _counts = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _lastCleanup = new();
 
-    public static int Increment(string windowKey, string ip)
+    public int Increment(string windowKey, string ip)
     {
         var count = _counts.AddOrUpdate(windowKey, 1, (_, existing) => existing + 1);
 
