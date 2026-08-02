@@ -60,7 +60,24 @@ public sealed class HttpMatchLauncher : IMatchLauncher
                 $"Game server {config.ServerId} is not registered — cannot start match.");
 
         var arena = string.IsNullOrEmpty(config.ArenaName) ? DefaultArena : config.ArenaName;
-        var matchId = Guid.NewGuid().ToString();
+        var matchGuid = Guid.NewGuid();
+        var matchId = matchGuid.ToString();
+        var players = config.Players;
+
+        // Create the Match row up front so the game server's later
+        // POST /match/result finds it (issue #40). Rolled back on launch failure.
+        _db.Matches.Add(new MasterServer.Data.Models.Match
+        {
+            Id = matchGuid,
+            Player1SteamId = players[0].SteamId,
+            Player2SteamId = players[1].SteamId,
+            Player3SteamId = players.Count > 2 ? players[2].SteamId : null,
+            Player4SteamId = players.Count > 3 ? players[3].SteamId : null,
+            ServerRegion = server.Region,
+            StartedAt = DateTime.UtcNow,
+        });
+        await _db.SaveChangesAsync();
+
         var body = new
         {
             matchId,
@@ -80,17 +97,31 @@ public sealed class HttpMatchLauncher : IMatchLauncher
             "Launching match {MatchId} on server {ServerId} ({Url}) with {Count} players",
             matchId, config.ServerId, url, config.Players.Count);
 
-        using var response = await _http.PostAsJsonAsync(url, body);
-        response.EnsureSuccessStatusCode();
+        try
+        {
+            using var response = await _http.PostAsJsonAsync(url, body);
+            response.EnsureSuccessStatusCode();
 
-        var result = await response.Content.ReadFromJsonAsync<MatchStartResponse>();
-        if (result is null || result.Port <= 0)
-            throw new InvalidOperationException(
-                $"Game server {config.ServerId} did not return a valid match port.");
+            var result = await response.Content.ReadFromJsonAsync<MatchStartResponse>();
+            if (result is null || result.Port <= 0)
+                throw new InvalidOperationException(
+                    $"Game server {config.ServerId} did not return a valid match port.");
 
-        _logger.LogInformation(
-            "Match {MatchId} launched on port {Port}", matchId, result.Port);
-        return result.Port;
+            _logger.LogInformation(
+                "Match {MatchId} launched on port {Port}", matchId, result.Port);
+            return result.Port;
+        }
+        catch
+        {
+            // Roll the pre-created row back so a failed launch leaves no orphan.
+            var row = await _db.Matches.FindAsync(matchGuid);
+            if (row != null)
+            {
+                _db.Matches.Remove(row);
+                await _db.SaveChangesAsync();
+            }
+            throw;
+        }
     }
 
     private sealed class MatchStartResponse

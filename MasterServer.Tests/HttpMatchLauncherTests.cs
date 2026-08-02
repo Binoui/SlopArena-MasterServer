@@ -99,6 +99,18 @@ public class HttpMatchLauncherTests
         Assert.Equal(2, players[1].GetProperty("entityId").GetInt32());
         Assert.NotEmpty(body.RootElement.GetProperty("matchId").GetString()!);
         Assert.Equal("split", body.RootElement.GetProperty("arenaName").GetString());
+
+        // Issue #40: the Match row is created up front with the same Guid posted
+        // to the game server, winner still NULL, 2-player roster → no P3/P4.
+        var match = Assert.Single(db.Matches);
+        Assert.Equal(Guid.Parse(body.RootElement.GetProperty("matchId").GetString()!), match.Id);
+        Assert.Equal(101, match.Player1SteamId);
+        Assert.Equal(202, match.Player2SteamId);
+        Assert.Null(match.Player3SteamId);
+        Assert.Null(match.Player4SteamId);
+        Assert.Null(match.WinnerSteamId);
+        Assert.Equal("EU", match.ServerRegion);
+        Assert.Null(match.EndedAt);
     }
 
     [Fact]
@@ -148,5 +160,19 @@ public class HttpMatchLauncherTests
         var config = new MatchStartedConfig(ServerId, TwoPlayerRoster());
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => launcher.LaunchAsync(config));
+    }
+
+    [Fact]
+    public async Task LaunchAsync_Failure_RollsBackMatchRow()
+    {
+        // Issue #40: a failed launch must not leave an orphan Match row.
+        var handler = new StubHandler { Status = HttpStatusCode.InternalServerError };
+        var db = SeedServer("127.0.0.1", 9876);
+        var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
+
+        var config = new MatchStartedConfig(ServerId, TwoPlayerRoster());
+
+        await Assert.ThrowsAsync<HttpRequestException>(() => launcher.LaunchAsync(config));
+        Assert.Empty(db.Matches);
     }
 }

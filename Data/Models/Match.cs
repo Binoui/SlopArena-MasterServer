@@ -6,6 +6,8 @@ public class Match
     public Guid Id { get; set; } = Guid.NewGuid();
     public long Player1SteamId { get; set; }
     public long Player2SteamId { get; set; }
+    public long? Player3SteamId { get; set; }
+    public long? Player4SteamId { get; set; }
     public long? WinnerSteamId { get; set; } // Null for draws or disconnects
     public string ServerRegion { get; set; } = string.Empty;
     public DateTime StartedAt { get; set; } = DateTime.UtcNow;
