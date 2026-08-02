@@ -8,7 +8,7 @@ using Microsoft.AspNetCore.SignalR;
 namespace MasterServer.Hubs;
 
 /// <summary>
-/// SignalR hub managing per-game-server lobby state (ADR-0004, issue #32).
+/// SignalR hub managing per-game-server lobby state (ADR-0004, see docs/adr/; issue #32).
 /// One lobby per game server, identified by <c>serverId</c>. The hub is a thin
 /// adapter: <see cref="LobbyManager"/> owns the state, the hub performs the
 /// SignalR group joins and broadcasts.
@@ -68,8 +68,8 @@ public sealed class LobbyHub : Hub
     }
 
     /// <summary>
-    /// Host-only: transitions the lobby to character select (ADR-0008, issue
-    /// #34). Broadcasts <c>MatchStarting</c> so all clients switch to the char
+    /// Host-only: transitions the lobby to character select (ADR-0008, see
+    /// docs/adr/; issue #34). Broadcasts <c>MatchStarting</c> so all clients switch to the char
     /// select screen. Does NOT launch the game server — that happens in
     /// <see cref="StartMatch"/> once all players lock in.
     /// </summary>

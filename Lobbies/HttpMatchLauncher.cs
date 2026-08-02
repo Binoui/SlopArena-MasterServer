@@ -31,8 +31,8 @@ public interface IMatchLauncher
 /// the registered base port) exposing <c>POST /match/start</c>. The master server
 /// looks up the game server's IP + port from the registration record, sends the
 /// roster (steamId + locked-in characterClass + assigned entityId), and reads back
-/// the match port. This keeps the game server stateless between matches (ADR-0008)
-/// and matches the existing game→master result report (also HTTP).
+/// the match port. This keeps the game server stateless between matches (ADR-0008,
+/// see docs/adr/), and matches the existing game→master result report (also HTTP).
 /// </summary>
 public sealed class HttpMatchLauncher : IMatchLauncher
 {

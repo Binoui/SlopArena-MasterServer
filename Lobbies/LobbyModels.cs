@@ -3,7 +3,7 @@ namespace MasterServer.Lobbies;
 
 /// <summary>
 /// A player present in a lobby. Lobby state is in-memory and ephemeral
-/// (see ADR-0004): the master server is the lobby authority only while up.
+/// (see ADR-0004, docs/adr/): the master server is the lobby authority only while up.
 /// </summary>
 public sealed record LobbyPlayer(
     long SteamId,

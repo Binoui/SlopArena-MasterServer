@@ -4,7 +4,7 @@ using System.Collections.Concurrent;
 namespace MasterServer.Lobbies;
 
 /// <summary>
-/// In-memory lobby state authority (ADR-0004). One lobby per game server,
+/// In-memory lobby state authority (ADR-0004, see docs/adr/). One lobby per game server,
 /// keyed by <c>serverId</c>. Lobbies are ephemeral: they live only while the
 /// master server process is up, which is acceptable for the demo.
 /// </summary>
