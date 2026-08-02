@@ -354,45 +354,17 @@ app.MapPost("/match/result", async (
             return Results.NotFound(new { error = "Match not found" });
         }
 
-        match.WinnerSteamId = request.WinnerSteamId;
+        match.WinnerSteamId = request.WinnerSteamId > 0 ? request.WinnerSteamId : null;
         match.EndedAt = DateTime.UtcNow;
 
-        // Apply ELO rating system for MMR adjustment
-        var winner = await db.Users.FindAsync(request.WinnerSteamId);
-        var loser = await db.Users.FindAsync(
-            match.Player1SteamId == request.WinnerSteamId
-                ? match.Player2SteamId
-                : match.Player1SteamId);
-
-        int mmrChange = 0;
-        if (winner != null && loser != null)
-        {
-            var expectedWin = 1.0 / (1.0 + Math.Pow(10, (loser.Mmr - winner.Mmr) / 400.0));
-            var kFactor = 32;
-            mmrChange = (int)(kFactor * (1 - expectedWin));
-
-            winner.Mmr += mmrChange;
-            loser.Mmr -= mmrChange;
-
-            // Keep MMR non-negative
-            winner.Mmr = Math.Max(0, winner.Mmr);
-            loser.Mmr = Math.Max(0, loser.Mmr);
-
-            logger.LogInformation("Match {MatchId}: Winner={WinnerId} (+{Change}), Loser={LoserId} (-{Change})",
-                request.MatchId, request.WinnerSteamId, mmrChange,
-                match.Player1SteamId == request.WinnerSteamId ? match.Player2SteamId : match.Player1SteamId, mmrChange);
-        }
-        else
-        {
-            logger.LogWarning("Match {MatchId}: Could not find winner or loser user", request.MatchId);
-        }
+        // MMR update disabled (issue #40) — the Match row + winner are still recorded.
 
         server.CurrentMatches = Math.Max(0, server.CurrentMatches - 1);
 
         await db.SaveChangesAsync();
         await transaction.CommitAsync();
 
-        return Results.Ok(new { status = "recorded", mmrChange });
+        return Results.Ok(new { status = "recorded", mmrChange = 0 });
     }
     catch
     {
