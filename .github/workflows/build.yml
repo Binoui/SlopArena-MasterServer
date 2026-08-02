@@ -23,6 +23,12 @@ jobs:
       - name: Configure GitHub Packages
         run: dotnet nuget add source --username Binoui --password ${{ secrets.GITHUB_TOKEN }} --store-password-in-clear-text --name github "https://nuget.pkg.github.com/Binoui/index.json"
 
+      # nuget.config references a gitignored local dev feed (.local-feed) that
+      # does not exist on runners; NuGet fails restore (NU1301) on a missing
+      # local source, so drop it in CI — SlopArena.Shared comes from GitHub Packages.
+      - name: Remove local dev feed (CI-only)
+        run: dotnet nuget remove source local-sloparena
+
       - name: Restore
         run: dotnet restore
 
