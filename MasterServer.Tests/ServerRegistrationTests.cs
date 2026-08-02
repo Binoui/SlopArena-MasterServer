@@ -121,6 +121,25 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
     }
 
     [Fact]
+    public async Task Register_WithDnsHostnameIp_IsAccepted()
+    {
+        var client = CreateClient();
+
+        // ADR-0009: official servers behind NAT register with a public domain
+        // (e.g. sloparena.barakaslurp.fr). The validator must accept DNS names,
+        // not just IPv4 literals.
+        var request = UniqueRequest() with { IpAddress = "sloparena.barakaslurp.fr" };
+
+        var response = await client.PostAsJsonAsync("/servers/register", request);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var row = (await response.Content.ReadFromJsonAsync<RegisterResponse>())!;
+        var stored = await FindGameServerAsync(row.ServerId);
+        Assert.NotNull(stored);
+        Assert.Equal("sloparena.barakaslurp.fr", stored.IpAddress);
+    }
+
+    [Fact]
     public async Task Deregister_WithCorrectToken_RemovesRowImmediately()
     {
         var client = CreateClient();
