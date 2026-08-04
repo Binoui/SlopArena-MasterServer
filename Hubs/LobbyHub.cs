@@ -38,31 +38,39 @@ public sealed class LobbyHub : Hub
     /// <summary>Join the lobby for a specific game server. Requires JWT auth.</summary>
     public async Task JoinLobby(Guid serverId)
     {
-        if (!TryGetSteamId(out var steamId))
-            throw new HubException("Authenticated identity missing.");
+        try
+        {
+            if (!TryGetSteamId(out var steamId))
+                throw new HubException("Authenticated identity missing.");
 
-        var user = await _db.Users.FindAsync(steamId);
-        if (user is null)
-            throw new HubException("Authenticated user not found.");
+            var user = await _db.Users.FindAsync(steamId);
+            if (user is null)
+                throw new HubException("Authenticated user not found.");
 
-        var result = _lobbies.JoinLobby(serverId, Context.ConnectionId, steamId, user.Username);
+            var result = _lobbies.JoinLobby(serverId, Context.ConnectionId, steamId, user.Username);
 
-        // Rejected joins (e.g. lobby at capacity, issue #6) surface as a
-        // HubException before any group membership or broadcast happens.
-        if (!result.Success)
-            throw new HubException(result.Error ?? "Join rejected.");
+            // Rejected joins (e.g. lobby at capacity, issue #6) surface as a
+            // HubException before any group membership or broadcast happens.
+            if (!result.Success)
+                throw new HubException(result.Error ?? "Join rejected.");
 
-        // If the connection was previously in a different lobby, announce the
-        // departure to the old lobby's survivors and drop the old group membership.
-        if (result.Departure is { } dep)
-            await AnnounceDeparture(dep.ServerId, dep.Player, dep.Snapshot);
+            // If the connection was previously in a different lobby, announce the
+            // departure to the old lobby's survivors and drop the old group membership.
+            if (result.Departure is { } dep)
+                await AnnounceDeparture(dep.ServerId, dep.Player, dep.Snapshot);
 
-        await Groups.AddToGroupAsync(Context.ConnectionId, GroupName(serverId));
+            await Groups.AddToGroupAsync(Context.ConnectionId, GroupName(serverId));
 
-        _logger.LogInformation("Lobby {ServerId}: {Username} ({SteamId}) joined", serverId, user.Username, steamId);
+            _logger.LogInformation("Lobby {ServerId}: {Username} ({SteamId}) joined", serverId, user.Username, steamId);
 
-        await Clients.Group(GroupName(serverId)).SendAsync("PlayerJoined", result.Player!);
-        await Clients.Group(GroupName(serverId)).SendAsync("LobbyUpdated", result.Snapshot!);
+            await Clients.Group(GroupName(serverId)).SendAsync("PlayerJoined", result.Player!);
+            await Clients.Group(GroupName(serverId)).SendAsync("LobbyUpdated", result.Snapshot!);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "JoinLobby FAILED: server {ServerId} connection {ConnectionId}", serverId, Context.ConnectionId);
+            throw;
+        }
     }
 
     /// <summary>Leave the current lobby.</summary>
