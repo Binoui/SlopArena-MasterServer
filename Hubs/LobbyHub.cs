@@ -1,23 +1,19 @@
 // MasterServer/Hubs/LobbyHub.cs
 using System.Security.Claims;
+using MasterServer.Chat;
 using MasterServer.Data;
 using MasterServer.Lobbies;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 
 namespace MasterServer.Hubs;
 
 /// <summary>
-/// SignalR hub managing per-game-server lobby state (ADR-0004, see docs/adr/; issue #32).
-/// One lobby per game server, identified by <c>serverId</c>. The hub is a thin
-/// adapter: <see cref="LobbyManager"/> owns the state, the hub performs the
-/// SignalR group joins and broadcasts.
-///
-/// Server → client pushes: <c>PlayerJoined</c>, <c>PlayerLeft</c>,
-/// <c>LobbyUpdated</c>, <c>CharacterSelected</c>, <c>MatchStarting</c>,
-/// <c>MatchStarted</c>.
-/// Client → server methods: <see cref="JoinLobby"/>, <see cref="LeaveLobby"/>,
-/// <see cref="HostStart"/>, <see cref="SelectCharacter"/>, <see cref="StartMatch"/>.
+/// Authenticated game-wide chat and per-GameServer lobby control.
+/// LobbyManager owns admission; ChatService owns presence, message budgets,
+/// immutable history, and recipient snapshots. Network sends happen outside
+/// the state locks. Chat never participates in gameplay simulation.
 /// </summary>
 [Authorize]
 public sealed class LobbyHub : Hub
@@ -26,58 +22,134 @@ public sealed class LobbyHub : Hub
     private readonly AppDbContext _db;
     private readonly IMatchLauncher _launcher;
     private readonly ILogger<LobbyHub> _logger;
+    private readonly ChatService _chat;
 
-    public LobbyHub(LobbyManager lobbies, AppDbContext db, IMatchLauncher launcher, ILogger<LobbyHub> logger)
+    public LobbyHub(LobbyManager lobbies, AppDbContext db, IMatchLauncher launcher,
+        ILogger<LobbyHub> logger, ChatService chat)
     {
         _lobbies = lobbies;
         _db = db;
         _launcher = launcher;
         _logger = logger;
+        _chat = chat;
+    }
+
+    public override async Task OnConnectedAsync()
+    {
+        if (!TryGetSteamId(out var playerId))
+            throw new HubException("Authenticated identity missing.");
+
+        ChatPresence? presence;
+        await _chat.MembershipGate.WaitAsync(Context.ConnectionAborted);
+        try
+        {
+            var user = await _db.Users.FindAsync(playerId);
+            if (user is null)
+                throw new HubException("Authenticated user not found.");
+            presence = _chat.Connect(playerId, user.Username, Context.ConnectionId);
+        }
+        finally
+        {
+            _chat.MembershipGate.Release();
+        }
+
+        try
+        {
+            await base.OnConnectedAsync();
+            if (presence is not null)
+                await Clients.All.SendAsync("ChatPresenceChanged", presence);
+        }
+        catch
+        {
+            // SignalR does not promise OnDisconnected after a failed connect.
+            _chat.Disconnect(Context.ConnectionId);
+            throw;
+        }
+    }
+
+    public ChatSnapshot GetChatState() => _chat.GetSnapshot(Context.ConnectionId);
+
+    public ChatPlayer[] GetOnlinePlayers() => _chat.GetOnlinePlayers();
+
+    public Task<ChatMessage> SendGlobal(string text)
+        => Deliver(_chat.SendGlobal(Context.ConnectionId, text));
+
+    public Task<ChatMessage> SendServer(Guid serverId, string text)
+        => Deliver(_chat.SendServer(Context.ConnectionId, serverId, text));
+
+    public Task<ChatMessage> SendDirect(string playerId, string text)
+        => Deliver(_chat.SendDirect(Context.ConnectionId, playerId, text));
+
+    private async Task<ChatMessage> Deliver(ChatDelivery delivery)
+    {
+        await Clients.Clients(delivery.ConnectionIds)
+            .SendAsync("ChatMessage", delivery.Message, Context.ConnectionAborted);
+        // Acceptance is not a recipient delivery/read receipt.
+        return delivery.Message;
     }
 
     /// <summary>Join the lobby for a specific game server. Requires JWT auth.</summary>
     public async Task JoinLobby(Guid serverId)
     {
+        if (!TryGetSteamId(out var playerId))
+            throw new HubException("Authenticated identity missing.");
+
+        JoinLobbyResult result;
+        ServerChatState serverChat;
+        await _chat.MembershipGate.WaitAsync(Context.ConnectionAborted);
         try
         {
-            if (!TryGetSteamId(out var steamId))
-                throw new HubException("Authenticated identity missing.");
+            var cutoff = DateTime.UtcNow.AddSeconds(-15);
+            if (!await _db.GameServers.AnyAsync(
+                    server => server.Id == serverId && server.LastHeartbeat >= cutoff,
+                    Context.ConnectionAborted))
+                throw new HubException("server_unavailable");
+            if (_chat.HasOtherLobbyConnection(playerId, Context.ConnectionId))
+                throw new HubException("already_joined");
 
-            var user = await _db.Users.FindAsync(steamId);
+            var user = await _db.Users.FindAsync(playerId);
             if (user is null)
                 throw new HubException("Authenticated user not found.");
 
-            var result = _lobbies.JoinLobby(serverId, Context.ConnectionId, steamId, user.Username);
-
-            // Rejected joins (e.g. lobby at capacity, issue #6) surface as a
-            // HubException before any group membership or broadcast happens.
-            if (!result.Success)
-                throw new HubException(result.Error ?? "Join rejected.");
-
-            // If the connection was previously in a different lobby, announce the
-            // departure to the old lobby's survivors and drop the old group membership.
-            if (result.Departure is { } dep)
-                await AnnounceDeparture(dep.ServerId, dep.Player, dep.Snapshot);
-
-            await Groups.AddToGroupAsync(Context.ConnectionId, GroupName(serverId));
-
-            _logger.LogInformation("Lobby {ServerId}: {Username} ({SteamId}) joined", serverId, user.Username, steamId);
-
-            await Clients.Group(GroupName(serverId)).SendAsync("PlayerJoined", result.Player!);
-            await Clients.Group(GroupName(serverId)).SendAsync("LobbyUpdated", result.Snapshot!);
+            lock (_chat.MembershipSync)
+            {
+                result = _lobbies.JoinLobby(serverId, Context.ConnectionId, playerId, user.Username);
+                if (!result.Success)
+                    throw new HubException(result.Error ?? "Join rejected.");
+                serverChat = _chat.GetServerState(Context.ConnectionId);
+            }
         }
-        catch (Exception ex)
+        finally
         {
-            _logger.LogError(ex, "JoinLobby FAILED: server {ServerId} connection {ConnectionId}", serverId, Context.ConnectionId);
-            throw;
+            _chat.MembershipGate.Release();
         }
+
+        if (result.Departure is { } departure)
+            await AnnounceDeparture(departure.ServerId, departure.Player, departure.Snapshot);
+
+        await Groups.AddToGroupAsync(Context.ConnectionId, GroupName(serverId));
+        _logger.LogInformation("Lobby {ServerId}: player {PlayerId} joined", serverId, playerId);
+        await Clients.Group(GroupName(serverId)).SendAsync("PlayerJoined", result.Player!);
+        await Clients.Group(GroupName(serverId)).SendAsync("LobbyUpdated", result.Snapshot!);
+        await Clients.Caller.SendAsync("ChatServerChanged", serverChat);
     }
 
     /// <summary>Leave the current lobby.</summary>
     public async Task LeaveLobby()
     {
-        var (serverId, player, snapshot) = _lobbies.LeaveLobby(Context.ConnectionId);
-        await AnnounceDeparture(serverId, player, snapshot);
+        LeaveLobbyResult departure;
+        await _chat.MembershipGate.WaitAsync(Context.ConnectionAborted);
+        try
+        {
+            lock (_chat.MembershipSync)
+                departure = _lobbies.LeaveLobby(Context.ConnectionId);
+        }
+        finally
+        {
+            _chat.MembershipGate.Release();
+        }
+        await AnnounceDeparture(departure.ServerId, departure.Player, departure.Snapshot);
+        await Clients.Caller.SendAsync("ChatServerChanged", new ServerChatState(null, []));
     }
 
     /// <summary>
@@ -146,8 +218,25 @@ public sealed class LobbyHub : Hub
     /// <summary>Cleanup on disconnect: drop the player and announce to survivors.</summary>
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
-        var (serverId, player, snapshot) = _lobbies.LeaveLobby(Context.ConnectionId);
-        await AnnounceDeparture(serverId, player, snapshot);
+        LeaveLobbyResult departure;
+        ChatPresence? presence;
+        // ConnectionAborted is already cancelled here; cleanup must still run.
+        await _chat.MembershipGate.WaitAsync();
+        try
+        {
+            lock (_chat.MembershipSync)
+            {
+                presence = _chat.Disconnect(Context.ConnectionId);
+                departure = _lobbies.LeaveLobby(Context.ConnectionId);
+            }
+        }
+        finally
+        {
+            _chat.MembershipGate.Release();
+        }
+        await AnnounceDeparture(departure.ServerId, departure.Player, departure.Snapshot);
+        if (presence is not null)
+            await Clients.All.SendAsync("ChatPresenceChanged", presence);
         await base.OnDisconnectedAsync(exception);
     }
 

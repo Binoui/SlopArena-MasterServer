@@ -12,7 +12,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      packages: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -20,15 +20,6 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
-
-      - name: Configure GitHub Packages
-        run: dotnet nuget add source --username Binoui --password ${{ secrets.GITHUB_TOKEN }} --store-password-in-clear-text --name github "https://nuget.pkg.github.com/Binoui/index.json"
-
-      # nuget.config references a gitignored local dev feed (.local-feed) that
-      # does not exist on runners; NuGet fails restore (NU1301) on a missing
-      # local source, so drop it in CI — SlopArena.Shared comes from GitHub Packages.
-      - name: Remove local dev feed (CI-only)
-        run: dotnet nuget remove source local-sloparena
 
       - name: Restore
         run: dotnet restore
@@ -39,7 +30,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     permissions:
-      packages: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -48,23 +39,16 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
-      - name: Configure GitHub Packages
-        run: dotnet nuget add source --username Binoui --password ${{ secrets.GITHUB_TOKEN }} --store-password-in-clear-text --name github "https://nuget.pkg.github.com/Binoui/index.json"
-
-      - name: Remove local dev feed (CI-only)
-        run: dotnet nuget remove source local-sloparena
-
       - name: Restore
-        run: dotnet restore
+        run: dotnet restore MasterServer.Tests/MasterServer.Tests.csproj
 
       - name: Test
-        run: dotnet test --no-restore --verbosity minimal
+        run: dotnet test MasterServer.Tests/MasterServer.Tests.csproj --no-restore --verbosity minimal
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
-      packages: read
       contents: write
     steps:
       - uses: actions/checkout@v4
@@ -74,14 +58,8 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
-      - name: Configure GitHub Packages
-        run: dotnet nuget add source --username Binoui --password ${{ secrets.GITHUB_TOKEN }} --store-password-in-clear-text --name github "https://nuget.pkg.github.com/Binoui/index.json"
-
-      - name: Remove local dev feed (CI-only)
-        run: dotnet nuget remove source local-sloparena
-
       - name: Publish
-        run: dotnet publish -c Release -o publish --no-restore --verbosity minimal
+        run: dotnet publish -c Release -o publish --verbosity minimal
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

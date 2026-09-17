@@ -1,5 +1,8 @@
 using System.Net;
 using System.Security.Cryptography;
+using System.Globalization;
+using System.Threading.RateLimiting;
+using MasterServer.Chat;
 using Microsoft.EntityFrameworkCore;
 using MasterServer.Data;
 using MasterServer.DTOs;
@@ -10,6 +13,8 @@ using System.Security.Claims;
 using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
+using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.AspNetCore.SignalR;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -19,7 +24,9 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSignalR();
+builder.Services.AddSignalR(options => options.AddFilter<ChatControlRateFilter>());
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<ChatService>();
 // JWT authentication — guest/dev auth (issue #30)
 var jwtSecret = builder.Configuration["Jwt:Secret"];
 if (string.IsNullOrWhiteSpace(jwtSecret))
@@ -83,44 +90,51 @@ builder.Services.AddSingleton<LobbyManager>();
 // AddHttpClient gives the launcher a managed, pooled HttpClient (avoids socket
 // exhaustion from per-scope `new HttpClient()` — issue #35 review).
 builder.Services.AddHttpClient<IMatchLauncher, HttpMatchLauncher>();
-builder.Services.AddSingleton<RateLimitTracker>();
 builder.Services.AddAuthorization();
+
+var rateLimitMax = builder.Configuration.GetValue("RateLimit:MaxRequestsPerWindow", 10);
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
+    {
+        var path = context.Request.Path;
+        // Long-poll POSTs carry both chat and lobby invocations. Enforce their
+        // separate per-identity budgets at the hub, not on the transport POST.
+        var isHubTransport = path == "/lobby" || path == "/lobby/";
+        var isProtectedWrite = HttpMethods.IsPost(context.Request.Method) ||
+            (HttpMethods.IsPut(context.Request.Method) && path.StartsWithSegments("/auth/name"));
+        if (isHubTransport || !isProtectedWrite)
+            return RateLimitPartition.GetNoLimiter("unlimited");
+
+        // A party signing in together must not spend the heartbeat/admission
+        // budget on guest creation, name setup, or connection negotiation.
+        var budget = path.StartsWithSegments("/auth/guest") ? "guest"
+            : path.StartsWithSegments("/auth/name") ? "name"
+            : path.StartsWithSegments("/auth/refresh") ? "refresh"
+            : path.StartsWithSegments("/lobby/negotiate") ? "negotiate"
+            : "control";
+        var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        return RateLimitPartition.GetFixedWindowLimiter(
+            $"{budget}:{ip}",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = rateLimitMax,
+                Window = TimeSpan.FromSeconds(10),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            });
+    });
+});
 
 var app = builder.Build();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
 
 app.MapGet("/health", () => new { status = "ok", version = "0.1.0" });
 
-// ── Rate limiting middleware ──
-// Configurable (RateLimit:MaxRequestsPerWindow) so integration tests can raise
-// the per-IP POST budget; production default stays 10.
-var rateLimitMax = builder.Configuration.GetValue("RateLimit:MaxRequestsPerWindow", 10);
-
-app.Use(async (context, next) =>
-{
-    // Only rate-limit POST endpoints
-    if (context.Request.Method == "POST")
-    {
-        var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-        var key = $"rate:{ip}";
-
-        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var windowStart = now / 10; // 10-second window
-        var windowKey = $"{key}:{windowStart}";
-
-        var tracker = context.RequestServices.GetRequiredService<RateLimitTracker>();
-        var current = tracker.Increment(windowKey, ip);
-        if (current > rateLimitMax)
-        {
-            logger.LogWarning("Rate limit exceeded for {Ip} ({Count} requests in 10s window)", ip, current);
-            context.Response.StatusCode = 429;
-            await context.Response.WriteAsJsonAsync(new { error = "Too many requests. Try again later." });
-            return;
-        }
-    }
-
-    await next(context);
-});
+// Includes guest creation and hub negotiation. Native limiter partitions expire
+// when idle; chat/control quotas live with the authenticated guest instead.
+app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
 
@@ -148,7 +162,7 @@ static string? ExtractBearerToken(HttpContext httpContext, ILogger logger)
         return token;
     }
 
-    logger.LogWarning("Authorization header missing Bearer prefix: {Header}", authHeader);
+    logger.LogWarning("Authorization header missing Bearer prefix");
     return null;
 }
 
@@ -177,8 +191,13 @@ static bool IsValidPort(int port) => port > 0 && port <= 65535;
 // ── Guest auth endpoint (issue #30) ──
 app.MapPost("/auth/guest", async (AppDbContext db) =>
 {
-    // Generate a guest SteamId below the real Steam ID range (76561197960265729+)
-    long steamId = Random.Shared.NextInt64(1, 76561197960265728);
+    // Eight base-36 digits give guests short tags without truncating identity.
+    // The database primary key remains the final uniqueness constraint.
+    long steamId;
+    do
+    {
+        steamId = Random.Shared.NextInt64(1, ChatText.GuestIdLimit);
+    } while (await db.Users.AnyAsync(user => user.SteamId == steamId));
 
     var user = new MasterServer.Data.Models.User
     {
@@ -192,11 +211,9 @@ app.MapPost("/auth/guest", async (AppDbContext db) =>
     db.Users.Add(user);
     await db.SaveChangesAsync();
 
-    var token = GenerateGuestJwt(steamId);
-
     logger.LogInformation("Guest auth: created user {SteamId} ({Username})", steamId, user.Username);
 
-    return Results.Ok(new GuestAuthResponse(token, steamId));
+    return Results.Ok(GenerateGuestAuth(steamId));
 });
 
 // ── Authed endpoint: get current user info (issue #30) ──
@@ -210,29 +227,99 @@ app.MapGet("/auth/me", async (HttpContext httpContext, AppDbContext db) =>
     if (user == null)
         return Results.NotFound(new { error = "User not found" });
 
-    return Results.Ok(new GuestUserInfo(user.SteamId, user.Username, user.Mmr));
+    return Results.Ok(new GuestUserInfo(user.SteamId, user.Username, user.Mmr,
+        ChatText.Player(user.SteamId, user.Username).SessionTag));
 }).RequireAuthorization();
 
-// ── Helper: generate a guest JWT (captures jwt config from top-level scope) ──
-string GenerateGuestJwt(long steamId)
+// The client applies its chosen name before connecting to the hub. This same
+// operation handles later renames; it never creates another guest identity.
+app.MapPut("/auth/name", async (
+    SetDisplayNameRequest request,
+    HttpContext context,
+    AppDbContext db,
+    ChatService chat,
+    IHubContext<LobbyHub> hub) =>
+{
+    if (!long.TryParse(context.User.FindFirst(ClaimTypes.NameIdentifier)?.Value,
+            NumberStyles.None, CultureInfo.InvariantCulture, out var playerId))
+        return Results.Unauthorized();
+
+    string name;
+    try
+    {
+        name = ChatText.DisplayName(request.DisplayName);
+    }
+    catch (HubException ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+
+    ChatPlayer profile;
+    bool notify;
+    await chat.MembershipGate.WaitAsync(context.RequestAborted);
+    try
+    {
+        if (chat.HasLobbyMembership(playerId))
+            return Results.Conflict(new { error = "joined_server" });
+
+        var user = await db.Users.FindAsync(playerId);
+        if (user is null)
+            return Results.NotFound(new { error = "User not found" });
+
+        var changed = user.Username != name;
+        if (changed)
+        {
+            user.Username = name;
+            await db.SaveChangesAsync(context.RequestAborted);
+        }
+        profile = chat.UpdateDisplayName(playerId, name);
+        notify = changed && chat.IsOnline(playerId);
+    }
+    finally
+    {
+        chat.MembershipGate.Release();
+    }
+
+    if (notify)
+        await hub.Clients.All.SendAsync("ChatPresenceChanged", new ChatPresence(profile, true),
+            context.RequestAborted);
+    return Results.Ok(profile);
+}).RequireAuthorization();
+
+app.MapPost("/auth/refresh", async (HttpContext context, AppDbContext db) =>
+{
+    if (!long.TryParse(context.User.FindFirst(ClaimTypes.NameIdentifier)?.Value,
+            NumberStyles.None, CultureInfo.InvariantCulture, out var playerId))
+        return Results.Unauthorized();
+    if (await db.Users.FindAsync(playerId) is null)
+        return Results.NotFound(new { error = "User not found" });
+    return Results.Ok(GenerateGuestAuth(playerId));
+}).RequireAuthorization();
+
+// Token renewal preserves the player identity. Expired tokens cannot silently
+// create another guest; the client must renew while its credential is valid.
+GuestAuthResponse GenerateGuestAuth(long steamId)
 {
     var claims = new[]
     {
-        new Claim(ClaimTypes.NameIdentifier, steamId.ToString()),
-        new Claim("steam_id", steamId.ToString())
+        new Claim(ClaimTypes.NameIdentifier, steamId.ToString(CultureInfo.InvariantCulture)),
+        new Claim("steam_id", steamId.ToString(CultureInfo.InvariantCulture)),
+        new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString("N"))
     };
 
     var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret));
     var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+    var expiresAt = DateTimeOffset.FromUnixTimeSeconds(
+        DateTimeOffset.UtcNow.AddHours(jwtExpiryHours).ToUnixTimeSeconds());
 
     var token = new JwtSecurityToken(
         issuer: jwtIssuer,
         audience: jwtAudience,
         claims: claims,
-        expires: DateTime.UtcNow.AddHours(jwtExpiryHours),
+        expires: expiresAt.UtcDateTime,
         signingCredentials: credentials);
 
-    return new JwtSecurityTokenHandler().WriteToken(token);
+    return new GuestAuthResponse(new JwtSecurityTokenHandler().WriteToken(token), steamId, expiresAt);
 }
 
 // ── Game server registration endpoint ──
@@ -484,39 +571,3 @@ app.Run();
 // Exposed for the test host (WebApplicationFactory<Program>).
 public partial class Program { }
 
-/// <summary>
-/// Simple in-memory rate limit tracker with auto-cleanup.
-/// Thread-safe via ConcurrentDictionary.
-/// Registered as a singleton so each app instance (each test factory, or the
-/// one production process) gets its own counters — a static class here would
-/// make parallel integration-test factories share one bucket and trip false
-/// 429s (observed in the full test suite).
-/// </summary>
-internal sealed class RateLimitTracker
-{
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _counts = new();
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _lastCleanup = new();
-
-    public int Increment(string windowKey, string ip)
-    {
-        var count = _counts.AddOrUpdate(windowKey, 1, (_, existing) => existing + 1);
-
-        // Lazy cleanup: every ~30s, remove entries older than 60s
-        var now = DateTime.UtcNow;
-        if (_lastCleanup.TryGetValue(ip, out var lastClean) && (now - lastClean).TotalSeconds < 30)
-            return count;
-
-        _lastCleanup[ip] = now;
-        var cutoff = now.AddSeconds(-60);
-        foreach (var key in _counts.Keys)
-        {
-            if (_counts.TryGetValue(key, out var _))
-            {
-                // Simple TTL: not perfect but avoids unbounded growth
-                // Production would use a proper sliding window with Redis
-            }
-        }
-
-        return count;
-    }
-}

@@ -84,6 +84,10 @@ public sealed class LobbyManager
     public LobbySnapshot? GetSnapshot(string connectionId)
         => _lobbyByConnection.TryGetValue(connectionId, out var lobby) ? lobby.Snapshot() : null;
 
+    /// <summary>The authoritative joined GameServer, without allocating a roster snapshot.</summary>
+    public Guid? GetServerId(string connectionId)
+        => _lobbyByConnection.TryGetValue(connectionId, out var lobby) ? lobby.ServerId : null;
+
     /// <summary>
     /// Attempts a host start for the connection. Only the lobby host may start
     /// (issue #32). On success returns the roster for the match-start broadcast.
