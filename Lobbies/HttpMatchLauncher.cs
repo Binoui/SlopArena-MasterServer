@@ -1,44 +1,36 @@
 // MasterServer/Lobbies/HttpMatchLauncher.cs
 using System.Net.Http.Json;
+using System.Text.Json;
 using MasterServer.Data;
 using Microsoft.EntityFrameworkCore;
-
 namespace MasterServer.Lobbies;
 
 /// <summary>
-/// Default arena for PvP matches until host arena-select is wired. Lives on
-/// the interface (not the concrete launcher) so the hub does not depend on
-/// <see cref="HttpMatchLauncher"/> just to read the default (issue #35 review).
+/// Launches a selected PvP arena on the registered GameServer.
 /// </summary>
 public interface IMatchLauncher
 {
-    /// <summary>Default arena used when the host has not picked one.</summary>
-    string DefaultArena { get; }
-
     /// <summary>
-    /// Tell the game server for <paramref name="config"/> to start a match with
-    /// the locked-in roster + entity IDs. Returns the UDP port the game server
-    /// assigned to the match, or throws if the game server rejects/unreachable.
+    /// Starts a match and returns both its assigned UDP port and the opaque
+    /// authoritative content map emitted by the GameServer.
     /// </summary>
-    Task<int> LaunchAsync(MatchStartedConfig config);
+    Task<MatchLaunchResult> LaunchAsync(MatchStartedConfig config);
 }
 
 /// <summary>
 /// Real <see cref="IMatchLauncher"/> (issue #35): POSTs the match-start command
-/// to the game server over HTTP and returns the UDP port it assigns.
+/// to the game server over HTTP and returns its assigned UDP port plus the
+/// opaque authoritative content map.
 ///
 /// The game server runs a tiny HTTP control listener (System.Net.HttpListener on
 /// the registered base port) exposing <c>POST /match/start</c>. The master server
 /// looks up the game server's IP + port from the registration record, sends the
-/// roster (steamId + locked-in character + assigned entityId), and reads back
-/// the match port. This keeps the game server stateless between matches (ADR-0008,
-/// see docs/adr/), and matches the existing game→master result report (also HTTP).
+/// roster (steamId + locked-in character + assigned entityId), and forwards the
+/// response's <c>content</c> JSON unchanged. This keeps the game server stateless
+/// between matches (ADR-0008), and matches the existing game→master result report.
 /// </summary>
 public sealed class HttpMatchLauncher : IMatchLauncher
 {
-    public const string DefaultArenaName = "split";
-    public string DefaultArena => DefaultArenaName;
-
     private readonly AppDbContext _db;
     private readonly HttpClient _http;
     private readonly ILogger<HttpMatchLauncher> _logger;
@@ -55,14 +47,14 @@ public sealed class HttpMatchLauncher : IMatchLauncher
         _http.Timeout = TimeSpan.FromSeconds(5);
     }
 
-    public async Task<int> LaunchAsync(MatchStartedConfig config)
+    public async Task<MatchLaunchResult> LaunchAsync(MatchStartedConfig config)
     {
         var server = await _db.GameServers.FindAsync(config.ServerId);
         if (server is null)
             throw new InvalidOperationException(
                 $"Game server {config.ServerId} is not registered — cannot start match.");
 
-        var arena = string.IsNullOrEmpty(config.ArenaName) ? DefaultArena : config.ArenaName;
+        var arena = config.ArenaName;
         var matchGuid = Guid.NewGuid();
         var matchId = matchGuid.ToString();
         var players = config.Players;
@@ -118,13 +110,14 @@ public sealed class HttpMatchLauncher : IMatchLauncher
             response.EnsureSuccessStatusCode();
 
             var result = await response.Content.ReadFromJsonAsync<MatchStartResponse>();
-            if (result is null || result.Port <= 0)
+            if (result is null || result.Port <= 0
+                || result.Content.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
                 throw new InvalidOperationException(
-                    $"Game server {config.ServerId} did not return a valid match port.");
+                    $"Game server {config.ServerId} did not return a valid match port/content payload.");
 
             _logger.LogInformation(
                 "Match {MatchId} launched on port {Port}", matchId, result.Port);
-            return result.Port;
+            return new MatchLaunchResult(result.Port, result.Content.Clone());
         }
         catch
         {
@@ -142,5 +135,6 @@ public sealed class HttpMatchLauncher : IMatchLauncher
     private sealed class MatchStartResponse
     {
         public int Port { get; set; }
+        public JsonElement Content { get; set; }
     }
 }

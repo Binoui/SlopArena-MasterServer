@@ -4,13 +4,10 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <DefaultItemExcludes>$(DefaultItemExcludes);MasterServer.Tests/**</DefaultItemExcludes>
     <NoWarn>CA1031</NoWarn> <!-- Server catches general exceptions intentionally -->
   </PropertyGroup>
 
-  <ItemGroup>
-    <!-- The test project lives in a subfolder; exclude it from this project's default .cs globbing. -->
-    <Compile Remove="MasterServer.Tests\**" />
-  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.0" />
@@ -24,8 +21,5 @@
     <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.19.1" />
   </ItemGroup>
 
-  <ItemGroup>
-    <PackageReference Include="SlopArena.Shared" Version="0.1.0" />
-  </ItemGroup>
 
 </Project>

@@ -1,5 +1,7 @@
 // MasterServer.Tests/LobbyHubTests.cs
+using System.Text.Json;
 using System.Security.Claims;
+using MasterServer.Chat;
 using MasterServer.Data;
 using MasterServer.Hubs;
 using MasterServer.Lobbies;
@@ -32,18 +34,41 @@ public class LobbyHubTests
         return db;
     }
 
-    private sealed class HubHarness(AppDbContext db)
+    private sealed class HubHarness
     {
-        public LobbyManager Lobbies { get; } = new();
+        private readonly AppDbContext _db;
+        public LobbyManager Lobbies { get; }
+        public ChatService Chat { get; }
         public Mock<IMatchLauncher> Launcher { get; } = new();
         public Mock<IHubCallerClients> Clients { get; } = new();
         public Mock<IGroupManager> Groups { get; } = new();
         public Mock<IClientProxy> GroupProxy { get; } = new();
 
+        public HubHarness(AppDbContext db)
+        {
+            _db = db;
+            Lobbies = new LobbyManager();
+            Chat = new ChatService(Lobbies, TimeProvider.System);
+            db.GameServers.Add(new MasterServer.Data.Models.GameServer
+            {
+                Id = ServerId,
+                Name = "Test",
+                IpAddress = "127.0.0.1",
+                Port = 9876,
+                Region = "EU",
+                MaxConcurrentMatches = 8,
+                LastHeartbeat = DateTime.UtcNow
+            });
+            db.SaveChanges();
+            Launcher.Setup(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()))
+                .ReturnsAsync(new MatchLaunchResult(
+                    9877,
+                    JsonDocument.Parse("""{"schemaVersion":1,"entries":[]}""").RootElement.Clone()));
+        }
+
         public LobbyHub CreateHub(string connectionId, long steamId, string username)
         {
-            // Seed the user so the hub's DB lookup succeeds.
-            db.Users.Add(new MasterServer.Data.Models.User
+            _db.Users.Add(new MasterServer.Data.Models.User
             {
                 SteamId = steamId,
                 Username = username,
@@ -51,15 +76,8 @@ public class LobbyHubTests
                 CreatedAt = DateTime.UtcNow,
                 LastLogin = DateTime.UtcNow
             });
-            // Launcher returns a deterministic match port + default arena so the
-            // MatchStarted broadcast carries stable values (issue #35).
-            Launcher.SetupGet(l => l.DefaultArena).Returns(HttpMatchLauncher.DefaultArenaName);
-            Launcher.Setup(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()))
-                .ReturnsAsync(9877);
-            db.SaveChanges();
+            _db.SaveChanges();
 
-            // Each hub gets its own context mock — connectionId must not bleed
-            // between hub instances (two players = two connections).
             var ctx = new Mock<HubCallerContext>();
             ctx.SetupGet(c => c.ConnectionId).Returns(connectionId);
             ctx.SetupGet(c => c.User!)
@@ -71,17 +89,17 @@ public class LobbyHubTests
             Clients.Setup(c => c.Group(It.IsAny<string>())).Returns(GroupProxy.Object);
             Clients.SetupGet(c => c.Caller).Returns(Mock.Of<ISingleClientProxy>());
 
-            var hub = new LobbyHub(
+            return new LobbyHub(
                 Lobbies,
-                db,
+                _db,
                 Launcher.Object,
-                Mock.Of<ILogger<LobbyHub>>())
+                Mock.Of<ILogger<LobbyHub>>(),
+                Chat)
             {
                 Context = ctx.Object,
                 Clients = Clients.Object,
                 Groups = Groups.Object
             };
-            return hub;
         }
     }
 
@@ -322,7 +340,7 @@ public class LobbyHubTests
         await hub1.SelectCharacter("Manki");
         await hub2.SelectCharacter("FightGuy");
 
-        await Assert.ThrowsAsync<HubException>(() => hub2.StartMatch());
+        await Assert.ThrowsAsync<HubException>(() => hub2.StartMatch("training"));
 
         harness.GroupProxy.Verify(
             p => p.SendCoreAsync("MatchStarted", It.IsAny<object[]>(), default),
@@ -345,7 +363,7 @@ public class LobbyHubTests
         await hub1.SelectCharacter("Manki");
         harness.GroupProxy.Reset();
 
-        await Assert.ThrowsAsync<HubException>(() => hub1.StartMatch());
+        await Assert.ThrowsAsync<HubException>(() => hub1.StartMatch("training"));
 
         harness.GroupProxy.Verify(
             p => p.SendCoreAsync("MatchStarted", It.IsAny<object[]>(), default),
@@ -367,19 +385,20 @@ public class LobbyHubTests
         await hub2.SelectCharacter("FightGuy");
         harness.GroupProxy.Reset();
 
-        await hub1.StartMatch();
+        await hub1.StartMatch("training");
 
         harness.GroupProxy.Verify(
             p => p.SendCoreAsync("MatchStarted", It.IsAny<object[]>(), default),
             Times.Once);
-        // The launcher is invoked with the roster + entity IDs (issue #35).
+        // The launcher is invoked with the roster + entity IDs + the chosen arena (issue #35).
         harness.Launcher.Verify(l => l.LaunchAsync(It.Is<MatchStartedConfig>(
             c => c.ServerId == ServerId
               && c.Players.Count == 2
               && c.Players[0].EntityId == 1
               && c.Players[1].EntityId == 2
               && c.Players[0].Character == "Manki"
-              && c.Players[1].Character == "FightGuy")), Times.Once);
+              && c.Players[1].Character == "FightGuy"
+              && c.ArenaName == "training")), Times.Once);
     }
 
     [Fact]
@@ -398,18 +417,50 @@ public class LobbyHubTests
         await hub2.SelectCharacter("FightGuy");
         harness.GroupProxy.Reset();
 
-        await hub1.StartMatch();
+        await hub1.StartMatch("slop_court");
 
         harness.Launcher.Verify(l => l.LaunchAsync(It.Is<MatchStartedConfig>(
-            c => c.ArenaName == HttpMatchLauncher.DefaultArenaName)), Times.Once);
+            c => c.ArenaName == "slop_court")), Times.Once);
         // The broadcast config carries the port the launcher returned (9877).
         // Cast (not `is` pattern) keeps this inside a Moq expression tree.
         harness.GroupProxy.Verify(
             p => p.SendCoreAsync("MatchStarted",
                 It.Is<object[]>(args => args.Length > 0
                     && ((MatchStartedConfig)args[0]).MatchPort == 9877
-                    && ((MatchStartedConfig)args[0]).ArenaName == HttpMatchLauncher.DefaultArenaName),
+                    && ((MatchStartedConfig)args[0]).ArenaName == "slop_court"),
                 default),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task StartMatch_MatchStartedFailure_ReleasesRosterButRetainsServerMembership()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        await hub1.SelectCharacter("Manki");
+        await hub2.SelectCharacter("FightGuy");
+        harness.GroupProxy.Reset();
+        harness.GroupProxy
+            .Setup(p => p.SendCoreAsync("MatchStarted", It.IsAny<object[]>(), default))
+            .ThrowsAsync(new InvalidOperationException("broadcast failed"));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => hub1.StartMatch("training"));
+
+        Assert.Null(harness.Lobbies.GetSnapshot("c1"));
+        Assert.Null(harness.Lobbies.GetSnapshot("c2"));
+        Assert.Equal(ServerId, harness.Lobbies.GetServerId("c1"));
+        Assert.Equal(ServerId, harness.Lobbies.GetServerId("c2"));
+        harness.Groups.Verify(
+            g => g.RemoveFromGroupAsync("c1", GroupName(ServerId), default),
+            Times.Once);
+        harness.Groups.Verify(
+            g => g.RemoveFromGroupAsync("c2", GroupName(ServerId), default),
             Times.Once);
     }
 
@@ -423,7 +474,73 @@ public class LobbyHubTests
         await hub1.JoinLobby(ServerId);
         await hub1.SelectCharacter("Manki");
 
-        await Assert.ThrowsAsync<HubException>(() => hub1.StartMatch());
+        await Assert.ThrowsAsync<HubException>(() => hub1.StartMatch("training"));
+    }
+
+    // ── StartStageSelect (stage select transition, before StartMatch) ──
+
+    [Fact]
+    public async Task StartStageSelect_AllLockedIn_Broadcasts_StageSelect_DoesNotLaunch()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        await hub1.SelectCharacter("Manki");
+        await hub2.SelectCharacter("FightGuy");
+        harness.GroupProxy.Reset();
+
+        await hub1.StartStageSelect();
+
+        // Broadcasts the stage-select transition, but must NOT launch the game
+        // server — that happens on StartMatch once the host picks an arena.
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("StageSelect", It.IsAny<object[]>(), default),
+            Times.Once);
+        harness.Launcher.Verify(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task StartStageSelect_NonHost_Throws_HubException()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        await hub1.SelectCharacter("Manki");
+        await hub2.SelectCharacter("FightGuy");
+
+        await Assert.ThrowsAsync<HubException>(() => hub2.StartStageSelect());
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("StageSelect", It.IsAny<object[]>(), default),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task StartStageSelect_NotAllLockedIn_Throws_HubException()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        // Only Alice locked in.
+        await hub1.SelectCharacter("Manki");
+
+        await Assert.ThrowsAsync<HubException>(() => hub1.StartStageSelect());
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("StageSelect", It.IsAny<object[]>(), default),
+            Times.Never);
     }
 
     [Fact]

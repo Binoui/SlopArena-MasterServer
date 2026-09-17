@@ -1,4 +1,5 @@
 // MasterServer.Tests/HttpMatchLauncherTests.cs
+using System.Text.Json;
 using System.Net;
 using System.Net.Http.Json;
 using MasterServer.Data;
@@ -31,14 +32,14 @@ public class HttpMatchLauncherTests
 
     /// <summary>
     /// A stub HttpMessageHandler that records the request and replies with a
-    /// JSON body the launcher must parse (<c>{ "port": 9877 }</c>).
+    /// JSON body the launcher must parse (<c>{ "port": 9877, "content": {} }</c>).
     /// </summary>
     private sealed class StubHandler : HttpMessageHandler
     {
         public string RequestBody { get; private set; } = "";
         public Uri? RequestUri { get; private set; }
         public HttpStatusCode Status { get; set; } = HttpStatusCode.OK;
-        public string ResponseBody { get; set; } = """{"port":9877}""";
+        public string ResponseBody { get; set; } = """{"port":9877,"content":{"schemaVersion":1,"entries":[]}}""";
 
         protected override Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request, CancellationToken ct)
@@ -89,10 +90,12 @@ public class HttpMatchLauncherTests
         var db = SeedServer("127.0.0.1", 9876);
         var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
 
-        var config = new MatchStartedConfig(ServerId, TwoPlayerRoster());
-        int port = await launcher.LaunchAsync(config);
+        var config = new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court");
+        var launch = await launcher.LaunchAsync(config);
 
-        Assert.Equal(9877, port);
+        Assert.Equal(9877, launch.MatchPort);
+        Assert.Equal(JsonValueKind.Object, launch.Content.ValueKind);
+        Assert.Equal(1, launch.Content.GetProperty("schemaVersion").GetInt32());
         Assert.Equal("http://127.0.0.1:9876/match/start", handler.RequestUri!.ToString());
 
         var body = System.Text.Json.JsonDocument.Parse(handler.RequestBody);
@@ -103,7 +106,7 @@ public class HttpMatchLauncherTests
         Assert.Equal("FightGuy", players[1].GetProperty("characterClass").GetString());
         Assert.Equal(2, players[1].GetProperty("entityId").GetInt32());
         Assert.NotEmpty(body.RootElement.GetProperty("matchId").GetString()!);
-        Assert.Equal("split", body.RootElement.GetProperty("arenaName").GetString());
+        Assert.Equal("slop_court", body.RootElement.GetProperty("arenaName").GetString());
 
         // Issue #40: the Match row is created up front with the same Guid posted
         // to the game server, winner still NULL, 2-player roster → no P3/P4.
@@ -138,7 +141,7 @@ public class HttpMatchLauncherTests
         var db = CreateInMemoryDb(); // no server registered
         var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(new StubHandler()));
 
-        var config = new MatchStartedConfig(ServerId, TwoPlayerRoster());
+        var config = new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court");
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => launcher.LaunchAsync(config));
     }
@@ -150,7 +153,7 @@ public class HttpMatchLauncherTests
         var db = SeedServer("127.0.0.1", 9876);
         var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
 
-        var config = new MatchStartedConfig(ServerId, TwoPlayerRoster());
+        var config = new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court");
 
         await Assert.ThrowsAsync<HttpRequestException>(() => launcher.LaunchAsync(config));
     }
@@ -162,7 +165,7 @@ public class HttpMatchLauncherTests
         var db = SeedServer("127.0.0.1", 9876);
         var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
 
-        var config = new MatchStartedConfig(ServerId, TwoPlayerRoster());
+        var config = new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court");
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => launcher.LaunchAsync(config));
     }
@@ -175,7 +178,7 @@ public class HttpMatchLauncherTests
         var db = SeedServer("127.0.0.1", 9876);
         var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
 
-        var config = new MatchStartedConfig(ServerId, TwoPlayerRoster());
+        var config = new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court");
 
         await Assert.ThrowsAsync<HttpRequestException>(() => launcher.LaunchAsync(config));
         Assert.Empty(db.Matches);
@@ -190,7 +193,7 @@ public class HttpMatchLauncherTests
         var db = SeedServer("127.0.0.1", 9876);
         var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
 
-        var config = new MatchStartedConfig(ServerId, Roster(5));
+        var config = new MatchStartedConfig(ServerId, Roster(5), 0, "slop_court");
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => launcher.LaunchAsync(config));
 
@@ -206,7 +209,7 @@ public class HttpMatchLauncherTests
         var db = SeedServer("127.0.0.1", 9876);
         var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
 
-        var config = new MatchStartedConfig(ServerId, Roster(1));
+        var config = new MatchStartedConfig(ServerId, Roster(1), 0, "slop_court");
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => launcher.LaunchAsync(config));
 
@@ -221,10 +224,10 @@ public class HttpMatchLauncherTests
         var db = SeedServer("127.0.0.1", 9876);
         var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
 
-        var config = new MatchStartedConfig(ServerId, Roster(4));
-        int port = await launcher.LaunchAsync(config);
+        var config = new MatchStartedConfig(ServerId, Roster(4), 0, "slop_court");
+        var launch = await launcher.LaunchAsync(config);
 
-        Assert.Equal(9877, port);
+        Assert.Equal(9877, launch.MatchPort);
         var match = Assert.Single(db.Matches);
         Assert.NotNull(match.Player3SteamId);
         Assert.NotNull(match.Player4SteamId);

@@ -1,4 +1,5 @@
 // MasterServer/Lobbies/LobbyModels.cs
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace MasterServer.Lobbies;
@@ -35,30 +36,38 @@ public sealed record LobbySnapshot(Guid ServerId, IReadOnlyList<LobbyPlayer> Pla
 public sealed record MatchStartingConfig(Guid ServerId, IReadOnlyList<LobbyPlayer> Players);
 
 /// Payload of the <c>MatchStarted</c> push broadcast when the host starts the
-/// actual match from char select (all players locked in). Carries the final
-/// roster with characters + entity IDs, the UDP port the game server
-/// assigned to the match, and the arena the game server loaded (issue #35).
+/// actual match from stage select (all players locked in). Carries the final
+/// roster with characters + entity IDs, the UDP port and arena, plus the
+/// GameServer's opaque authoritative content admission JSON.
 /// </summary>
 public sealed record MatchStartedConfig(
     Guid ServerId,
     IReadOnlyList<LobbyPlayer> Players,
     int MatchPort = 0,
-    string ArenaName = "");
+    string ArenaName = "",
+    JsonElement? Content = null);
 
 /// <summary>
-/// Result of a player joining a lobby. The hub uses this to perform the
-/// SignalR group join and the <c>PlayerJoined</c>/<c>LobbyUpdated</c> broadcasts.
-/// <c>Departure</c> is non-null when the connection was previously in a
-/// different lobby — the hub must announce the departure to the old lobby.
-/// <c>Success</c> is false (with <c>Error</c>) when the join was rejected,
-/// e.g. the lobby is at capacity (issue #6); Player/Snapshot are null then.
+/// Result of a player entering a GameServer. <c>Success</c> means a waiting
+/// roster slot was admitted. <c>ServerAdmitted</c> means authoritative Server
+/// Chat membership was admitted; it remains true when the waiting roster is
+/// full and <c>Error</c> is <c>lobby_full</c>-equivalent.
 /// </summary>
 public sealed record JoinLobbyResult(
     bool Success,
     string? Error,
     LobbyPlayer? Player,
     LobbySnapshot? Snapshot,
-    LeaveLobbyResult? Departure);
+    LeaveLobbyResult? Departure,
+    bool ServerAdmitted = false);
+
+/// <summary>Authoritative result returned by the game server match-start endpoint.</summary>
+/// <remarks>
+/// <see cref="Content"/> is intentionally an opaque JSON element. The Master
+/// forwards the game server's cooked content admission map to clients without
+/// taking a Shared dependency or interpreting gameplay data.
+/// </remarks>
+public sealed record MatchLaunchResult(int MatchPort, JsonElement Content);
 
 /// <summary>
 /// Result of a player leaving a lobby (or disconnecting). <c>ServerId</c> is null

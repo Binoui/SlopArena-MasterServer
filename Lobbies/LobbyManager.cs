@@ -4,15 +4,23 @@ using System.Collections.Concurrent;
 namespace MasterServer.Lobbies;
 
 /// <summary>
-/// In-memory lobby state authority (ADR-0004, see docs/adr/). One lobby per game server,
-/// keyed by <c>serverId</c>. Lobbies are ephemeral: they live only while the
-/// master server process is up, which is acceptable for the demo.
+/// In-memory lobby and authoritative GameServer-membership state. Waiting-room
+/// roster capacity is deliberately separate from server membership: once a
+/// match launches, its players leave the roster but remain members of the
+/// GameServer channel until they explicitly leave or switch.
 /// </summary>
 public sealed class LobbyManager
 {
+    private const int MaxRememberedMemberships = 1024;
+    private static readonly TimeSpan RememberedMembershipLifetime = TimeSpan.FromHours(24);
+
     private readonly ConcurrentDictionary<Guid, Lobby> _lobbiesByServer = new();
     private readonly ConcurrentDictionary<string, Lobby> _lobbyByConnection = new();
+    private readonly ConcurrentDictionary<string, ServerMembership> _serverByConnection = new();
+    private readonly Dictionary<long, RememberedMembership> _rememberedBySteamId = new();
+    private readonly object _gate = new();
     private readonly int _maxPlayersPerLobby;
+    private long _membershipAccess;
 
     /// <param name="options">Lobby capacity options (issue #6); defaults to 4 per lobby.</param>
     public LobbyManager(LobbyOptions? options = null)
@@ -21,129 +29,281 @@ public sealed class LobbyManager
     }
 
     /// <summary>
-    /// Adds a player to the lobby for <paramref name="serverId"/>. The first
-    /// player to join an empty lobby becomes the host (issue #32).
+    /// Admit a connection to a GameServer and, when a waiting slot exists, its
+    /// waiting roster. A full waiting roster does not reject GameServer chat:
+    /// the result is unsuccessful for lobby UI but <see cref="ServerAdmitted"/>
+    /// remains true and the caller has authoritative Server Chat membership.
     /// </summary>
     public JoinLobbyResult JoinLobby(Guid serverId, string connectionId, long steamId, string username)
     {
-        var lobby = _lobbiesByServer.GetOrAdd(serverId, _ => new Lobby(serverId, _maxPlayersPerLobby));
-
-        // Already in this lobby (duplicate join) — return current state without
-        // removing/re-adding to avoid a duplicate player.
-        if (_lobbyByConnection.TryGetValue(connectionId, out var previous) && previous == lobby)
-            return new JoinLobbyResult(true, null, lobby.GetPlayer(connectionId), lobby.Snapshot(), null);
-
-        // Capacity is enforced atomically under the lobby lock, so concurrent
-        // joins cannot oversubscribe. A rejected join leaves the connection
-        // wherever it was (issue #6).
-        var joined = lobby.AddPlayer(connectionId, steamId, username);
-        if (joined is null)
-            return new JoinLobbyResult(false,
-                $"Lobby is full (max {_maxPlayersPerLobby} players).", null, null, null);
-
-        // The join succeeded — depart any previous lobby and surface the departure
-        // so the hub can announce it to the old lobby's survivors and drop the
-        // old SignalR group membership.
-        LeaveLobbyResult? departure = null;
-        if (previous is not null)
+        lock (_gate)
         {
-            var player = previous.RemovePlayer(connectionId);
-            if (previous.IsEmpty)
-                _lobbiesByServer.TryRemove(previous.ServerId, out _);
-            departure = new LeaveLobbyResult(previous.ServerId, player, previous.Snapshot());
-        }
+            PruneRememberedLocked();
+            var lobby = _lobbiesByServer.GetOrAdd(serverId, _ => new Lobby(serverId, _maxPlayersPerLobby));
 
-        _lobbyByConnection[connectionId] = lobby;
-        return new JoinLobbyResult(true, null, joined, lobby.Snapshot(), departure);
+            if (_serverByConnection.TryGetValue(connectionId, out var current)
+                && current.ServerId == serverId
+                && _lobbyByConnection.TryGetValue(connectionId, out var currentLobby)
+                && currentLobby == lobby)
+            {
+                return new JoinLobbyResult(true, null, currentLobby.GetPlayer(connectionId),
+                    currentLobby.Snapshot(), null, ServerAdmitted: true);
+            }
+
+            var joined = lobby.AddPlayer(connectionId, steamId, username);
+            var departure = RemovePreviousMembershipLocked(connectionId, preserveRecent: false);
+            var admittedPlayer = joined ?? new LobbyPlayer(steamId, username, null, false, false);
+            _serverByConnection[connectionId] = new ServerMembership(serverId, admittedPlayer);
+            RememberLocked(steamId, serverId, admittedPlayer);
+
+            if (joined is null)
+            {
+                return new JoinLobbyResult(
+                    false,
+                    $"Lobby is full (max {_maxPlayersPerLobby} players).",
+                    null,
+                    null,
+                    departure,
+                    ServerAdmitted: true);
+            }
+
+            _lobbyByConnection[connectionId] = lobby;
+            _serverByConnection[connectionId] = new ServerMembership(serverId, joined);
+            RememberLocked(steamId, serverId, joined);
+            return new JoinLobbyResult(true, null, joined, lobby.Snapshot(), departure, ServerAdmitted: true);
+        }
     }
 
     /// <summary>
-    /// Removes a player from whatever lobby they were in (used on
-    /// <c>OnDisconnectedAsync</c> and on explicit <c>LeaveLobby</c>).
+    /// Reconnect-only admission for an active match connection. It validates a
+    /// remembered identity/server pair and restores only Server Chat membership;
+    /// it never adds a waiting-roster player. The hub validates GameServer
+    /// freshness before calling this method.
     /// </summary>
-    public LeaveLobbyResult LeaveLobby(string connectionId)
+    public bool ResumeServer(Guid serverId, string connectionId, long steamId, string username, out string? error)
     {
-        if (!_lobbyByConnection.TryRemove(connectionId, out var lobby))
-            return new LeaveLobbyResult(null, null, null);
-
-        var player = lobby.RemovePlayer(connectionId);
-        // Reap empty lobbies so an idle server does not accumulate state, and
-        // signal "nothing left to broadcast" via a null snapshot to the caller.
-        if (lobby.IsEmpty)
+        lock (_gate)
         {
-            _lobbiesByServer.TryRemove(lobby.ServerId, out _);
-            return new LeaveLobbyResult(lobby.ServerId, player, null);
-        }
+            PruneRememberedLocked();
+            if (_serverByConnection.TryGetValue(connectionId, out var current))
+            {
+                if (current.ServerId == serverId)
+                {
+                    error = null;
+                    return true;
+                }
+                error = "already_joined";
+                return false;
+            }
 
-        return new LeaveLobbyResult(lobby.ServerId, player, lobby.Snapshot());
+            foreach (var (candidateConnection, membership) in _serverByConnection)
+            {
+                if (candidateConnection != connectionId && membership.Player.SteamId == steamId)
+                {
+                    error = "already_joined";
+                    return false;
+                }
+            }
+
+            if (!_rememberedBySteamId.TryGetValue(steamId, out var remembered)
+                || remembered.ServerId != serverId)
+            {
+                error = "not_admitted";
+                return false;
+            }
+
+            var player = remembered.Player with { Username = username };
+            _serverByConnection[connectionId] = new ServerMembership(serverId, player);
+            RememberLocked(steamId, serverId, player);
+            error = null;
+            return true;
+        }
     }
 
     /// <summary>
-    /// Returns the lobby a connection currently belongs to, or null.
+    /// Explicitly leaves both the waiting roster and authoritative server
+    /// membership. This clears the remembered reconnect admission.
     /// </summary>
-    public LobbySnapshot? GetSnapshot(string connectionId)
-        => _lobbyByConnection.TryGetValue(connectionId, out var lobby) ? lobby.Snapshot() : null;
+    public LeaveLobbyResult LeaveLobby(string connectionId, long steamId)
+    {
+        lock (_gate)
+        {
+            _rememberedBySteamId.Remove(steamId);
+            if (!_serverByConnection.TryGetValue(connectionId, out _))
+                return new LeaveLobbyResult(null, null, null);
+
+            return RemovePreviousMembershipLocked(connectionId, preserveRecent: true)
+                ?? new LeaveLobbyResult(null, null, null);
+        }
+    }
 
     /// <summary>
-    /// Attempts a host start for the connection. Only the lobby host may start
-    /// (issue #32). On success returns the roster for the match-start broadcast.
+    /// Disconnect cleanup removes the connection's live membership and waiting
+    /// slot but preserves the bounded remembered server admission for
+    /// <see cref="ResumeServer"/>.
     /// </summary>
+    public LeaveLobbyResult DisconnectConnection(string connectionId)
+    {
+        lock (_gate)
+            return RemovePreviousMembershipLocked(connectionId, preserveRecent: true)
+                ?? new LeaveLobbyResult(null, null, null);
+    }
+
+    /// <summary>The authoritative joined GameServer, including active matches.</summary>
+    public Guid? GetServerId(string connectionId)
+        => _serverByConnection.TryGetValue(connectionId, out var membership) ? membership.ServerId : null;
+
+    /// <summary>Removes launched players from the waiting roster but keeps server membership.</summary>
+    public IReadOnlyList<string> ReleaseMatchRoster(Guid serverId, IReadOnlyList<long> steamIds)
+    {
+        lock (_gate)
+        {
+            if (!_lobbiesByServer.TryGetValue(serverId, out var lobby))
+                return Array.Empty<string>();
+
+            var ids = steamIds.ToHashSet();
+            var removed = lobby.RemovePlayers(ids);
+            foreach (var (connectionId, player) in removed)
+            {
+                _lobbyByConnection.TryRemove(connectionId, out _);
+                if (_serverByConnection.TryGetValue(connectionId, out var membership)
+                    && membership.ServerId == serverId)
+                {
+                    var retained = membership with { Player = player };
+                    _serverByConnection[connectionId] = retained;
+                    RememberLocked(player.SteamId, serverId, player);
+                }
+            }
+
+            if (lobby.IsEmpty)
+                _lobbiesByServer.TryRemove(serverId, out _);
+            return removed.Select(item => item.ConnectionId).ToArray();
+        }
+    }
+
+    /// <summary>Returns the waiting-roster snapshot for a connection, if any.</summary>
+    public LobbySnapshot? GetSnapshot(string connectionId)
+    {
+        lock (_gate)
+            return _lobbyByConnection.TryGetValue(connectionId, out var lobby) ? lobby.Snapshot() : null;
+    }
+
+    /// <summary>Attempts a host start for the waiting roster.</summary>
     public HostStartResult TryHostStart(string connectionId)
     {
-        if (!_lobbyByConnection.TryGetValue(connectionId, out var lobby))
-            return new HostStartResult(false, "You are not in a lobby.", null);
-
-        if (!lobby.IsHostByConnection(connectionId, out var host))
-            return new HostStartResult(false, "Only the host can start the match.", null);
-
-        return new HostStartResult(true, null, new MatchStartingConfig(lobby.ServerId, lobby.Snapshot().Players));
+        lock (_gate)
+        {
+            if (!_lobbyByConnection.TryGetValue(connectionId, out var lobby))
+                return new HostStartResult(false, "You are not in a lobby.", null);
+            if (!lobby.IsHostByConnection(connectionId, out _))
+                return new HostStartResult(false, "Only the host can start the match.", null);
+            return new HostStartResult(true, null, new MatchStartingConfig(lobby.ServerId, lobby.Snapshot().Players));
+        }
     }
 
-    /// <summary>
-    /// Locks in a character selection for the connection's player (issue #34).
-    /// The player may call this again to change their pick before the match
-    /// starts. Returns the updated player + full snapshot for the
-    /// <c>CharacterSelected</c> + <c>LobbyUpdated</c> broadcasts.
-    /// </summary>
+    /// <summary>Locks in a character selection for the waiting roster.</summary>
     public SelectCharacterResult SelectCharacter(string connectionId, string character)
     {
-        if (!_lobbyByConnection.TryGetValue(connectionId, out var lobby))
-            return new SelectCharacterResult(false, "You are not in a lobby.", null, null);
-
-        var (player, snapshot) = lobby.SelectCharacter(connectionId, character);
-        if (player is null)
-            return new SelectCharacterResult(false, "You are not in a lobby.", null, null);
-
-        return new SelectCharacterResult(true, null, player, snapshot);
+        lock (_gate)
+        {
+            if (!_lobbyByConnection.TryGetValue(connectionId, out var lobby))
+                return new SelectCharacterResult(false, "You are not in a lobby.", null, null);
+            var (player, snapshot) = lobby.SelectCharacter(connectionId, character);
+            if (player is null)
+                return new SelectCharacterResult(false, "You are not in a lobby.", null, null);
+            if (_serverByConnection.TryGetValue(connectionId, out var membership))
+            {
+                var updated = membership with { Player = player };
+                _serverByConnection[connectionId] = updated;
+                RememberLocked(player.SteamId, membership.ServerId, player);
+            }
+            return new SelectCharacterResult(true, null, player, snapshot);
+        }
     }
 
-    /// <summary>
-    /// Host-only: starts the actual match from char select (issue #34).
-    /// Requires all players locked in and a minimum of 2 players. On success
-    /// returns the final roster with character classes for the game server
-    /// launch + <c>MatchStarted</c> broadcast.
-    /// </summary>
-    public StartMatchResult TryStartMatch(string connectionId)
+    /// <summary>Host-only match start from stage select.</summary>
+    public StartMatchResult TryStartMatch(string connectionId, string arena)
     {
-        if (!_lobbyByConnection.TryGetValue(connectionId, out var lobby))
-            return new StartMatchResult(false, "You are not in a lobby.", null);
+        lock (_gate)
+        {
+            if (!_lobbyByConnection.TryGetValue(connectionId, out var lobby))
+                return new StartMatchResult(false, "You are not in a lobby.", null);
+            if (!lobby.IsHostByConnection(connectionId, out _))
+                return new StartMatchResult(false, "Only the host can start the match.", null);
+            if (!lobby.IsAllLockedIn(out var lockedInError))
+                return new StartMatchResult(false, lockedInError, null);
+            if (string.IsNullOrWhiteSpace(arena))
+                return new StartMatchResult(false, "Arena name missing.", null);
 
-        if (!lobby.IsHostByConnection(connectionId, out _))
-            return new StartMatchResult(false, "Only the host can start the match.", null);
-
-        if (!lobby.IsAllLockedIn(out var lockedInError))
-            return new StartMatchResult(false, lockedInError, null);
-
-        var players = lobby.Snapshot().Players;
-        var withEntityIds = players.Select((p, i) => p with { EntityId = i + 1 }).ToList();
-        return new StartMatchResult(true, null,
-            new MatchStartedConfig(lobby.ServerId, withEntityIds));
+            var players = lobby.Snapshot().Players;
+            var withEntityIds = players.Select((p, i) => p with { EntityId = i + 1 }).ToList();
+            return new StartMatchResult(true, null,
+                new MatchStartedConfig(lobby.ServerId, withEntityIds, ArenaName: arena));
+        }
     }
 
-    /// <summary>
-    /// A single lobby: an ordered, locked player list. The first player is the
-    /// host; on host departure the next-joined player is promoted.
-    /// </summary>
+    /// <summary>Checks whether every waiting-roster player has locked in.</summary>
+    public bool IsAllLockedIn(string connectionId, out string? error)
+    {
+        lock (_gate)
+        {
+            if (!_lobbyByConnection.TryGetValue(connectionId, out var lobby))
+            {
+                error = "You are not in a lobby.";
+                return false;
+            }
+            return lobby.IsAllLockedIn(out error);
+        }
+    }
+
+    private LeaveLobbyResult? RemovePreviousMembershipLocked(string connectionId, bool preserveRecent)
+    {
+        _serverByConnection.TryRemove(connectionId, out var membership);
+        _lobbyByConnection.TryRemove(connectionId, out var lobby);
+        if (membership is null)
+            return null;
+
+        if (!preserveRecent)
+            _rememberedBySteamId.Remove(membership.Player.SteamId);
+
+        LobbyPlayer? player = membership.Player;
+        LobbySnapshot? snapshot = null;
+        if (lobby is not null)
+        {
+            player = lobby.RemovePlayer(connectionId) ?? player;
+            if (lobby.IsEmpty)
+                _lobbiesByServer.TryRemove(lobby.ServerId, out _);
+            else
+                snapshot = lobby.Snapshot();
+        }
+        return new LeaveLobbyResult(membership.ServerId, player, snapshot);
+    }
+
+    private void RememberLocked(long steamId, Guid serverId, LobbyPlayer player)
+    {
+        _membershipAccess++;
+        _rememberedBySteamId[steamId] = new RememberedMembership(serverId, player, DateTime.UtcNow, _membershipAccess);
+        if (_rememberedBySteamId.Count <= MaxRememberedMemberships)
+            return;
+
+        var oldest = _rememberedBySteamId.MinBy(pair => pair.Value.Access);
+        _rememberedBySteamId.Remove(oldest.Key);
+    }
+
+    private void PruneRememberedLocked()
+    {
+        var cutoff = DateTime.UtcNow - RememberedMembershipLifetime;
+        foreach (var key in _rememberedBySteamId
+                     .Where(pair => pair.Value.LastSeenUtc < cutoff)
+                     .Select(pair => pair.Key)
+                     .ToArray())
+            _rememberedBySteamId.Remove(key);
+    }
+
+    private sealed record ServerMembership(Guid ServerId, LobbyPlayer Player);
+    private sealed record RememberedMembership(Guid ServerId, LobbyPlayer Player, DateTime LastSeenUtc, long Access);
+
+    /// <summary>A single waiting roster. Active-match players are not retained here.</summary>
     private sealed class Lobby(Guid serverId, int maxPlayers)
     {
         private readonly object _gate = new();
@@ -151,19 +311,13 @@ public sealed class LobbyManager
 
         public Guid ServerId => serverId;
 
-        /// <summary>
-        /// Adds a player as the newest player. Returns null when the lobby is
-        /// at capacity (issue #6) — the caller must treat that as a rejection.
-        /// </summary>
         public LobbyPlayer? AddPlayer(string connectionId, long steamId, string username)
         {
             lock (_gate)
             {
                 if (_players.Count >= maxPlayers)
                     return null;
-
-                var isHost = _players.Count == 0;
-                var player = new PlayerState(connectionId, steamId, username, null, false, isHost);
+                var player = new PlayerState(connectionId, steamId, username, null, false, _players.Count == 0);
                 _players.Add(player);
                 return player.ToPlayer();
             }
@@ -184,24 +338,29 @@ public sealed class LobbyManager
             {
                 var idx = _players.FindIndex(m => m.ConnectionId == connectionId);
                 if (idx < 0) return null;
-
                 var removed = _players[idx];
                 _players.RemoveAt(idx);
-
-                // Promote the now-first player to host when the host left.
                 if (removed.IsHost && _players.Count > 0)
                     _players[0] = _players[0] with { IsHost = true };
-
                 return removed.ToPlayer();
+            }
+        }
+
+        public IReadOnlyList<(string ConnectionId, LobbyPlayer Player)> RemovePlayers(ISet<long> steamIds)
+        {
+            lock (_gate)
+            {
+                var removed = _players.Where(player => steamIds.Contains(player.SteamId)).ToArray();
+                _players.RemoveAll(player => steamIds.Contains(player.SteamId));
+                if (_players.Count > 0 && !_players.Any(player => player.IsHost))
+                    _players[0] = _players[0] with { IsHost = true };
+                return removed.Select(player => (player.ConnectionId, player.ToPlayer())).ToArray();
             }
         }
 
         public bool IsEmpty
         {
-            get
-            {
-                lock (_gate) { return _players.Count == 0; }
-            }
+            get { lock (_gate) return _players.Count == 0; }
         }
 
         public bool IsHostByConnection(string connectionId, out LobbyPlayer? host)
@@ -222,70 +381,49 @@ public sealed class LobbyManager
         public LobbySnapshot Snapshot()
         {
             lock (_gate)
-            {
                 return new LobbySnapshot(serverId, _players.Select(m => m.ToPlayer()).ToList());
-            }
         }
 
-        /// <summary>
-        /// Locks in a character selection for the player on this connection
-        /// (issue #34). Returns the updated player + snapshot, or null player
-        /// if the connection is not in this lobby.
-        /// </summary>
-        public (LobbyPlayer? Player, LobbySnapshot Snapshot) SelectCharacter(
-            string connectionId, string character)
+        public (LobbyPlayer? Player, LobbySnapshot Snapshot) SelectCharacter(string connectionId, string character)
         {
             lock (_gate)
             {
                 var idx = _players.FindIndex(m => m.ConnectionId == connectionId);
                 if (idx < 0)
                     return (null, Snapshot());
-
-                _players[idx] = _players[idx] with
-                {
-                    Character = character,
-                    LockedIn = true
-                };
+                _players[idx] = _players[idx] with { Character = character, LockedIn = true };
                 return (_players[idx].ToPlayer(), Snapshot());
             }
         }
 
-        /// <summary>
-        /// Checks whether all players have locked in a character. Returns false
-        /// with a descriptive error if not. Minimum 2 players required (issue #6).
-        /// </summary>
         public bool IsAllLockedIn(out string? error)
         {
             lock (_gate)
             {
                 if (_players.Count < LobbyLimits.MinPlayers)
                 {
-                    error = $"Need at least {LobbyLimits.MinPlayers} players to start.";
+                    error = $"At least {LobbyLimits.MinPlayers} players are required to start.";
                     return false;
                 }
-
-                var unlocked = _players.FirstOrDefault(m => !m.LockedIn);
-                if (unlocked != default)
+                if (_players.Any(player => !player.LockedIn))
                 {
-                    error = $"Waiting for {unlocked.Username} to lock in.";
+                    error = "All players must lock in a character before starting.";
                     return false;
                 }
-
                 error = null;
                 return true;
             }
         }
 
-        private readonly record struct PlayerState(
+        private sealed record PlayerState(
             string ConnectionId,
             long SteamId,
             string Username,
             string? Character,
             bool LockedIn,
-            bool IsHost,
-            int EntityId = 0)
+            bool IsHost)
         {
-            public LobbyPlayer ToPlayer() => new(SteamId, Username, Character, LockedIn, IsHost, EntityId);
+            public LobbyPlayer ToPlayer() => new(SteamId, Username, Character, LockedIn, IsHost);
         }
     }
 }
