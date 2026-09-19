@@ -137,6 +137,10 @@ public sealed class LobbyManager
         }
     }
 
+    /// <summary>The authoritative joined GameServer, without allocating a roster snapshot.</summary>
+    public Guid? GetServerId(string connectionId)
+        => _lobbyByConnection.TryGetValue(connectionId, out var lobby) ? lobby.ServerId : null;
+
     /// <summary>
     /// Disconnect cleanup removes the connection's live membership and waiting
     /// slot but preserves the bounded remembered server admission for
