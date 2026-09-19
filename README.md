@@ -143,31 +143,42 @@ on restart. Do not compare sequences from different Master lifetimes.
 | `SendGlobal` | `text` | Accepted `ChatMessage` |
 | `SendServer` | `serverId`, `text` | Accepted `ChatMessage` |
 | `SendDirect` | `playerId`, `text` | Accepted `ChatMessage` |
+| `ResumeServer` | `serverId` | no return; emits `ChatServerChanged`; reconnect-only chat membership |
 
-Existing lobby calls remain: `JoinLobby`, `LeaveLobby`, `HostStart`,
-`SelectCharacter`, and `StartMatch`. Their existing events and payload keys remain.
+Existing lobby calls remain: `JoinLobby`, `ResumeServer`, `LeaveLobby`, `HostStart`,
+`SelectCharacter`, `StartStageSelect`, and `StartMatch(arenaName)`. Their existing
+events and payload keys remain; `MatchStarted` additionally carries the
+authoritative GameServer `content` JSON element alongside `matchPort` and
+`arenaName`.
 
 | Push | Payload | Meaning |
 | --- | --- | --- |
 | `ChatMessage` | `ChatMessage` | A live message, including the sender's echo |
 | `ChatPresenceChanged` | `ChatPresence` | First connection, last disconnect, or online rename |
-| `ChatServerChanged` | `ServerChatState` | The caller's successful join/switch/leave and current server backlog |
+| `ChatServerChanged` | `ServerChatState` | The caller's successful join/resume/switch/leave and current server backlog |
 
 Presence pushes are change notifications, not a durable ordered directory stream.
 Use `GetOnlinePlayers` for current state and after reconnect. Coalesce refreshes
 within the control budget. A failed query is not an empty directory.
 
 Global reaches every chat-connected participant. Server Chat reaches connections
-currently joined to that GameServer through `LobbyManager`, not a match group.
-An identity can join through only one connection at a time. Join requires a
-registered GameServer with a heartbeat no older than 15 seconds and an available
-lobby slot. Unknown/stale admission leaves existing membership unchanged.
+currently admitted to that GameServer through authoritative membership, not a
+waiting roster or match group. A successful `JoinLobby` admits Server Chat even
+when the 2–4 waiting roster is full; it then reports `lobby_full`, sends
+`ChatServerChanged`, and does not emit lobby-roster events. `ResumeServer` is
+only for reconnecting an identity's bounded remembered admission and never
+re-enters a waiting roster. `JoinLobby` is the explicit waiting-room/rematch
+operation.
 
-Server membership survives selection and match launch. Leave/switch updates the
-authoritative membership before later messages can be accepted. Disconnect drops
-that connection's membership; reconnect must explicitly rejoin a valid server.
-Do not trust a locally remembered server ID. Messages accepted before a departure
-can arrive late: inspect `serverId` and never display them as the new server's chat.
+Join requires a registered GameServer with a heartbeat no older than 15 seconds.
+Unknown/stale admission leaves existing membership unchanged. Server membership
+survives character/stage selection and match launch; launched players leave the
+waiting roster slots while retaining the GameServer channel. Leave/switch
+updates authoritative membership before later messages are accepted. Disconnect
+drops live connection membership but retains a bounded, expiring identity
+admission for `ResumeServer`; explicit Leave clears it. Reconnect must call
+`ResumeServer` for an in-match connection or `JoinLobby` for a waiting/rematch
+entry. Do not trust a locally remembered server ID.
 
 Direct reaches the sender's and target identity's live connections, once each.
 An offline target fails. There is no server-side Direct history or offline queue,
@@ -184,7 +195,7 @@ and a new guest with the same name is not the old recipient.
 | Public backlog | 50 Global messages; 50 per retained GameServer |
 | Retained GameServer backlogs | 256; evict the least-recently-used idle channel, not an active one |
 | Retained quota entries | 1,024 per budget; expire old entries before admitting more |
-
+| Remembered Server admissions | 1,024 identities; 24-hour expiry/LRU eviction; explicit Leave clears |
 Quota time is monotonic. Reconnect does not reset either budget. Invalid text,
 unauthorized server targets, and offline Direct attempts consume send allowance.
 HTTP write limits remain separate: by default, 10 requests per 10 seconds per IP
@@ -198,9 +209,9 @@ parse markup or links. The client must render names and text literally.
 
 Hub failures use `invalid_message`, `rate_limited`, `control_rate_limited`,
 `not_connected`, `not_in_server`, `recipient_offline`, `chat_capacity`,
-`already_joined`, or `server_unavailable`. The framework can wrap these codes in
-its error text. Invalid names return HTTP 400 `{ \"error\": \"invalid_name\" }`.
-Capacity rejection during connection setup closes the hub connection.
+`already_joined`, `server_unavailable`, `lobby_full`, or `not_admitted`. The
+framework can wrap these codes in its error text. Invalid names return HTTP 400
+`{ "error": "invalid_name" }`.
 Existing lobby-specific failures remain separate.
 
 Public history and presence exist only in this Master process. Restart clears

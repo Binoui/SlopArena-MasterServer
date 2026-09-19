@@ -1,263 +1,590 @@
 // MasterServer.Tests/LobbyHubTests.cs
-using System.Net.Http.Json;
 using System.Text.Json;
+using System.Security.Claims;
+using MasterServer.Chat;
 using MasterServer.Data;
-using MasterServer.DTOs;
+using MasterServer.Hubs;
 using MasterServer.Lobbies;
-using Microsoft.AspNetCore.Http.Connections;
-using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.SignalR;
-using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Moq;
 using Xunit;
 
 namespace MasterServer.Tests;
 
 /// <summary>
-/// Small real-wire lobby regression suite: an actual SignalR long-polling
-/// client against a WebApplicationFactory-hosted hub — no mocked
-/// Hub/Clients/GroupManager/SendCore forwarding. The exhaustive join/leave/
-/// select/start state-machine rules already live in LobbyManagerTests (pure,
-/// no SignalR) and HttpMatchLauncherTests; this file only defends the
-/// end-to-end behaviors a hub-wiring regression could actually break: host
-/// promotion, host-only start, full-lobby rejection, the pinned wire keys the
-/// client parses, and match-port delivery through a fake launcher (no real
-/// GameServer process needed).
+/// Unit tests for <see cref="LobbyHub"/> using a mocked SignalR context.
+/// Verifies the broadcast contracts from issue #32:
+/// <c>PlayerJoined</c>/<c>LobbyUpdated</c> on join, <c>PlayerLeft</c>/<c>LobbyUpdated</c>
+/// on leave, <c>HostStart</c> rejected for non-hosts, <c>MatchStarting</c> broadcast + launcher
+/// invoked for hosts.
 /// </summary>
-public class LobbyHubTests : IDisposable
+public class LobbyHubTests
 {
-    private readonly List<WebApplicationFactory<Program>> _factories = new();
-    private readonly List<HubConnection> _connections = new();
+    private static readonly Guid ServerId = Guid.Parse("33333333-3333-3333-3333-333333333333");
 
-    private sealed class FakeMatchLauncher(int port, string arena) : IMatchLauncher
+    private static AppDbContext CreateInMemoryDb()
     {
-        public string DefaultArena { get; } = arena;
-        public Task<int> LaunchAsync(MatchStartedConfig config) => Task.FromResult(port);
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
+            .Options;
+        var db = new AppDbContext(options);
+        return db;
     }
 
-    private sealed record ServerRegisterResponse(Guid ServerId, string ApiToken);
-
-    private (WebApplicationFactory<Program> Factory, HttpClient Client) CreateFactory(int maxPlayersPerLobby = 4)
+    private sealed class HubHarness
     {
-        var databaseName = $"lobby-hub-test-{Guid.NewGuid():N}";
-        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
+        private readonly AppDbContext _db;
+        public LobbyManager Lobbies { get; }
+        public ChatService Chat { get; }
+        public Mock<IMatchLauncher> Launcher { get; } = new();
+        public Mock<IHubCallerClients> Clients { get; } = new();
+        public Mock<IGroupManager> Groups { get; } = new();
+        public Mock<IClientProxy> GroupProxy { get; } = new();
+
+        public HubHarness(AppDbContext db)
         {
-            // TestServer connections all share the "unknown" IP in the rate
-            // limiter; raise the POST budget so long-polling + auth calls in
-            // this suite never trip it (that exclusion itself is covered by
-            // ChatIntegrationTests).
-            builder.ConfigureAppConfiguration((_, config) => config.AddInMemoryCollection(new Dictionary<string, string?>
+            _db = db;
+            Lobbies = new LobbyManager();
+            Chat = new ChatService(Lobbies, TimeProvider.System);
+            db.GameServers.Add(new MasterServer.Data.Models.GameServer
             {
-                ["RateLimit:MaxRequestsPerWindow"] = "100000",
-                ["Lobby:MaxPlayersPerLobby"] = maxPlayersPerLobby.ToString(),
-            }));
-
-            builder.ConfigureServices(services =>
-            {
-                Replace<DbContextOptions<AppDbContext>>(services);
-                services.AddDbContext<AppDbContext>(opts => opts.UseInMemoryDatabase(databaseName));
-
-                // A tiny fake for the external match-launch seam only — no
-                // real GameServer/Unity process needed to prove port delivery.
-                Replace<IMatchLauncher>(services);
-                services.AddSingleton<IMatchLauncher>(new FakeMatchLauncher(9877, "TestArena"));
+                Id = ServerId,
+                Name = "Test",
+                IpAddress = "127.0.0.1",
+                Port = 9876,
+                Region = "EU",
+                MaxConcurrentMatches = 8,
+                LastHeartbeat = DateTime.UtcNow
             });
-        });
-        _factories.Add(factory);
-        return (factory, factory.CreateClient());
-    }
+            db.SaveChanges();
+            Launcher.Setup(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()))
+                .ReturnsAsync(new MatchLaunchResult(
+                    9877,
+                    JsonDocument.Parse("""{"schemaVersion":1,"entries":[]}""").RootElement.Clone()));
+        }
 
-    private static void Replace<TService>(IServiceCollection services)
-    {
-        var descriptor = services.SingleOrDefault(d => d.ServiceType == typeof(TService));
-        if (descriptor is not null)
-            services.Remove(descriptor);
-    }
-
-    private static async Task<string> AuthGuestAsync(HttpClient client)
-    {
-        var response = await client.PostAsJsonAsync("/auth/guest", new { });
-        response.EnsureSuccessStatusCode();
-        var auth = (await response.Content.ReadFromJsonAsync<GuestAuthResponse>())!;
-        return auth.Token;
-    }
-
-    private static async Task<Guid> RegisterServerAsync(HttpClient client)
-    {
-        var response = await client.PostAsJsonAsync("/servers/register", new ServerRegistrationRequest(
-            Name: "TestServer",
-            IpAddress: "203.0.113.30",
-            Port: 20000,
-            Region: "EU",
-            IsOfficial: false,
-            MaxConcurrentMatches: 8,
-            CustomRulesJson: null));
-        response.EnsureSuccessStatusCode();
-        var body = (await response.Content.ReadFromJsonAsync<ServerRegisterResponse>())!;
-        return body.ServerId;
-    }
-
-    private async Task<HubConnection> ConnectAsync(WebApplicationFactory<Program> factory, string token)
-    {
-        var connection = new HubConnectionBuilder()
-            .WithUrl(new Uri(factory.Server.BaseAddress, "lobby"), options =>
+        public LobbyHub CreateHub(string connectionId, long steamId, string username)
+        {
+            _db.Users.Add(new MasterServer.Data.Models.User
             {
-                options.Transports = HttpTransportType.LongPolling;
-                options.HttpMessageHandlerFactory = _ => factory.Server.CreateHandler();
-                options.AccessTokenProvider = () => Task.FromResult<string?>(token);
-            })
-            .Build();
-        _connections.Add(connection);
-        await connection.StartAsync();
-        return connection;
-    }
+                SteamId = steamId,
+                Username = username,
+                Mmr = 1000,
+                CreatedAt = DateTime.UtcNow,
+                LastLogin = DateTime.UtcNow
+            });
+            _db.SaveChanges();
 
-    /// <summary>Registers a handler before the caller triggers the action, avoiding a race on the push.</summary>
-    private static Task<T> WaitForPushAsync<T>(HubConnection connection, string method, Func<T, bool> predicate, TimeSpan? timeout = null)
-    {
-        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var registration = connection.On<T>(method, value =>
-        {
-            if (predicate(value))
-                tcs.TrySetResult(value);
-        });
-        return AwaitWithTimeoutAsync(tcs, registration, timeout);
-    }
+            var ctx = new Mock<HubCallerContext>();
+            ctx.SetupGet(c => c.ConnectionId).Returns(connectionId);
+            ctx.SetupGet(c => c.User!)
+                .Returns(new ClaimsPrincipal(new ClaimsIdentity(new[]
+                {
+                    new Claim(ClaimTypes.NameIdentifier, steamId.ToString())
+                }, "TestAuth")));
 
-    private static async Task<T> AwaitWithTimeoutAsync<T>(TaskCompletionSource<T> tcs, IDisposable registration, TimeSpan? timeout)
-    {
-        try
-        {
-            return await tcs.Task.WaitAsync(timeout ?? TimeSpan.FromSeconds(5));
+            Clients.Setup(c => c.Group(It.IsAny<string>())).Returns(GroupProxy.Object);
+            Clients.SetupGet(c => c.Caller).Returns(Mock.Of<ISingleClientProxy>());
+
+            return new LobbyHub(
+                Lobbies,
+                _db,
+                Launcher.Object,
+                Mock.Of<ILogger<LobbyHub>>(),
+                Chat)
+            {
+                Context = ctx.Object,
+                Clients = Clients.Object,
+                Groups = Groups.Object
+            };
         }
-        finally
+    }
+
+    private static string GroupName(Guid id) => $"lobby:{id}";
+
+    [Fact]
+    public async Task JoinLobby_FirstPlayer_Broadcasts_PlayerJoined_And_LobbyUpdated()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub = harness.CreateHub("c1", 101, "Alice");
+
+        await hub.JoinLobby(ServerId);
+
+        // PlayerJoined + LobbyUpdated are both broadcast to the lobby group.
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("PlayerJoined", It.IsAny<object[]>(), default),
+            Times.Once);
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("LobbyUpdated", It.IsAny<object[]>(), default),
+            Times.Once);
+        // Added to the SignalR group for the server.
+        harness.Groups.Verify(
+            g => g.AddToGroupAsync("c1", GroupName(ServerId), default),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task JoinLobby_TwoPlayers_BothReceive_Broadcasts()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+
+        // Two joins → two PlayerJoined, two LobbyUpdated.
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("PlayerJoined", It.IsAny<object[]>(), default),
+            Times.Exactly(2));
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("LobbyUpdated", It.IsAny<object[]>(), default),
+            Times.Exactly(2));
+    }
+
+    [Fact]
+    public async Task LeaveLobby_Broadcasts_PlayerLeft_And_LobbyUpdated_To_Remaining()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        // Clear invocations from the join phase.
+        harness.GroupProxy.Reset();
+
+        await hub2.LeaveLobby();
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("PlayerLeft", It.IsAny<object[]>(), default),
+            Times.Once);
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("LobbyUpdated", It.IsAny<object[]>(), default),
+            Times.Once);
+        harness.Groups.Verify(
+            g => g.RemoveFromGroupAsync("c2", GroupName(ServerId), default),
+            Times.AtLeastOnce);
+    }
+
+    [Fact]
+    public async Task HostStart_NonHost_Throws_HubException()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+
+        await Assert.ThrowsAsync<HubException>(() => hub2.HostStart());
+
+        // Non-host start must NOT broadcast MatchStarting nor launch the match.
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("MatchStarting", It.IsAny<object[]>(), default),
+            Times.Never);
+        harness.Launcher.Verify(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task HostStart_Host_Broadcasts_MatchStarting_But_DoesNot_Launch()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+
+        await hub1.HostStart();
+
+        // HostStart transitions to char select: broadcasts MatchStarting but
+        // does NOT launch the game server (that's StartMatch, issue #34).
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("MatchStarting", It.IsAny<object[]>(), default),
+            Times.Once);
+        harness.Launcher.Verify(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task OnDisconnectedAsync_RemovesPlayer_Broadcasts_To_Survivors()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        harness.GroupProxy.Reset();
+
+        await hub2.OnDisconnectedAsync(null);
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("PlayerLeft", It.IsAny<object[]>(), default),
+            Times.Once);
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("LobbyUpdated", It.IsAny<object[]>(), default),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task OnDisconnectedAsync_LastPlayer_NoBroadcast()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+
+        await hub1.JoinLobby(ServerId);
+
+        // Clear invocations from the join phase — we only care about disconnect broadcasts.
+        harness.GroupProxy.Reset();
+
+        // Last player leaving → empty lobby → nothing to broadcast to.
+        await hub1.OnDisconnectedAsync(null);
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("PlayerLeft", It.IsAny<object[]>(), default),
+            Times.Never);
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("LobbyUpdated", It.IsAny<object[]>(), default),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task HostStart_PromotedHost_CanStart()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        await hub1.LeaveLobby(); // host leaves → Bob promoted
+
+        // Bob (now host) can start.
+        await hub2.HostStart();
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("MatchStarting", It.IsAny<object[]>(), default),
+            Times.Once);
+    }
+    [Fact]
+    public async Task SelectCharacter_LocksIn_And_Broadcasts_CharacterSelected_And_LobbyUpdated()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+
+        await hub1.JoinLobby(ServerId);
+        harness.GroupProxy.Reset();
+
+        await hub1.SelectCharacter("Manki");
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("CharacterSelected", It.IsAny<object[]>(), default),
+            Times.Once);
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("LobbyUpdated", It.IsAny<object[]>(), default),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task SelectCharacter_NonMember_Throws_HubException()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+
+        // Never joined a lobby.
+        await Assert.ThrowsAsync<HubException>(() => hub1.SelectCharacter("Manki"));
+    }
+
+    [Fact]
+    public async Task SelectCharacter_CanChangePick_Before_LockIn()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+
+        await hub1.JoinLobby(ServerId);
+
+        await hub1.SelectCharacter("Manki");
+        await hub1.SelectCharacter("FightGuy");
+
+        // Two CharacterSelected broadcasts (one per call).
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("CharacterSelected", It.IsAny<object[]>(), default),
+            Times.Exactly(2));
+    }
+
+    [Fact]
+    public async Task StartMatch_NonHost_Throws_HubException()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        await hub1.SelectCharacter("Manki");
+        await hub2.SelectCharacter("FightGuy");
+
+        await Assert.ThrowsAsync<HubException>(() => hub2.StartMatch("training"));
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("MatchStarted", It.IsAny<object[]>(), default),
+            Times.Never);
+        harness.Launcher.Verify(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task StartMatch_NotAllLockedIn_Throws_HubException()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+
+        // Only Alice locks in; Bob hasn't.
+        await hub1.SelectCharacter("Manki");
+        harness.GroupProxy.Reset();
+
+        await Assert.ThrowsAsync<HubException>(() => hub1.StartMatch("training"));
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("MatchStarted", It.IsAny<object[]>(), default),
+            Times.Never);
+        harness.Launcher.Verify(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task StartMatch_AllLockedIn_Broadcasts_MatchStarted_And_Launches()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        await hub1.SelectCharacter("Manki");
+        await hub2.SelectCharacter("FightGuy");
+        harness.GroupProxy.Reset();
+
+        await hub1.StartMatch("training");
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("MatchStarted", It.IsAny<object[]>(), default),
+            Times.Once);
+        // The launcher is invoked with the roster + entity IDs + the chosen arena (issue #35).
+        harness.Launcher.Verify(l => l.LaunchAsync(It.Is<MatchStartedConfig>(
+            c => c.ServerId == ServerId
+              && c.Players.Count == 2
+              && c.Players[0].EntityId == 1
+              && c.Players[1].EntityId == 2
+              && c.Players[0].Character == "Manki"
+              && c.Players[1].Character == "FightGuy"
+              && c.ArenaName == "training")), Times.Once);
+    }
+
+    [Fact]
+    public async Task StartMatch_AllLockedIn_BroadcastCarriesMatchPortAndArena()
+    {
+        // Issue #35: the MatchStarted broadcast must carry the game server's
+        // assigned UDP port + arena so clients connect to the right place.
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        await hub1.SelectCharacter("Manki");
+        await hub2.SelectCharacter("FightGuy");
+        harness.GroupProxy.Reset();
+
+        await hub1.StartMatch("slop_court");
+
+        harness.Launcher.Verify(l => l.LaunchAsync(It.Is<MatchStartedConfig>(
+            c => c.ArenaName == "slop_court")), Times.Once);
+        // The broadcast config carries the port the launcher returned (9877).
+        // Cast (not `is` pattern) keeps this inside a Moq expression tree.
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("MatchStarted",
+                It.Is<object[]>(args => args.Length > 0
+                    && ((MatchStartedConfig)args[0]).MatchPort == 9877
+                    && ((MatchStartedConfig)args[0]).ArenaName == "slop_court"),
+                default),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task StartMatch_MatchStartedFailure_ReleasesRosterButRetainsServerMembership()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        await hub1.SelectCharacter("Manki");
+        await hub2.SelectCharacter("FightGuy");
+        harness.GroupProxy.Reset();
+        harness.GroupProxy
+            .Setup(p => p.SendCoreAsync("MatchStarted", It.IsAny<object[]>(), default))
+            .ThrowsAsync(new InvalidOperationException("broadcast failed"));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => hub1.StartMatch("training"));
+
+        Assert.Null(harness.Lobbies.GetSnapshot("c1"));
+        Assert.Null(harness.Lobbies.GetSnapshot("c2"));
+        Assert.Equal(ServerId, harness.Lobbies.GetServerId("c1"));
+        Assert.Equal(ServerId, harness.Lobbies.GetServerId("c2"));
+        harness.Groups.Verify(
+            g => g.RemoveFromGroupAsync("c1", GroupName(ServerId), default),
+            Times.Once);
+        harness.Groups.Verify(
+            g => g.RemoveFromGroupAsync("c2", GroupName(ServerId), default),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task StartMatch_SinglePlayer_Throws_HubException()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+
+        await hub1.JoinLobby(ServerId);
+        await hub1.SelectCharacter("Manki");
+
+        await Assert.ThrowsAsync<HubException>(() => hub1.StartMatch("training"));
+    }
+
+    // ── StartStageSelect (stage select transition, before StartMatch) ──
+
+    [Fact]
+    public async Task StartStageSelect_AllLockedIn_Broadcasts_StageSelect_DoesNotLaunch()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        await hub1.SelectCharacter("Manki");
+        await hub2.SelectCharacter("FightGuy");
+        harness.GroupProxy.Reset();
+
+        await hub1.StartStageSelect();
+
+        // Broadcasts the stage-select transition, but must NOT launch the game
+        // server — that happens on StartMatch once the host picks an arena.
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("StageSelect", It.IsAny<object[]>(), default),
+            Times.Once);
+        harness.Launcher.Verify(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task StartStageSelect_NonHost_Throws_HubException()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        await hub1.SelectCharacter("Manki");
+        await hub2.SelectCharacter("FightGuy");
+
+        await Assert.ThrowsAsync<HubException>(() => hub2.StartStageSelect());
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("StageSelect", It.IsAny<object[]>(), default),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task StartStageSelect_NotAllLockedIn_Throws_HubException()
+    {
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        var hub1 = harness.CreateHub("c1", 101, "Alice");
+        var hub2 = harness.CreateHub("c2", 202, "Bob");
+
+        await hub1.JoinLobby(ServerId);
+        await hub2.JoinLobby(ServerId);
+        // Only Alice locked in.
+        await hub1.SelectCharacter("Manki");
+
+        await Assert.ThrowsAsync<HubException>(() => hub1.StartStageSelect());
+
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("StageSelect", It.IsAny<object[]>(), default),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task JoinLobby_FullLobby_Throws_HubException()
+    {
+        // Issue #6: a fifth player joining a full (4-player) lobby is rejected
+        // with a HubException and nothing is broadcast or group-added for them.
+        var db = CreateInMemoryDb();
+        var harness = new HubHarness(db);
+        for (int i = 0; i < 4; i++)
         {
-            registration.Dispose();
+            var h = harness.CreateHub($"c{i}", 100 + i, $"P{i}");
+            await h.JoinLobby(ServerId);
         }
-    }
+        var fifth = harness.CreateHub("c4", 505, "Eve");
 
-    public void Dispose()
-    {
-        foreach (var connection in _connections)
-            connection.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        foreach (var factory in _factories)
-            factory.Dispose();
-    }
+        await Assert.ThrowsAsync<HubException>(() => fifth.JoinLobby(ServerId));
 
-    [Fact]
-    public async Task JoinLobby_HostPromotion_PromotedHostCanStart()
-    {
-        var (factory, client) = CreateFactory();
-        var aliceToken = await AuthGuestAsync(client);
-        var bobToken = await AuthGuestAsync(client);
-        var serverId = await RegisterServerAsync(client);
-
-        var alice = await ConnectAsync(factory, aliceToken);
-        var bob = await ConnectAsync(factory, bobToken);
-
-        await alice.InvokeAsync("JoinLobby", serverId);
-        await bob.InvokeAsync("JoinLobby", serverId);
-
-        // Host (Alice, first joiner) leaves — Bob is promoted and can start.
-        await alice.InvokeAsync("LeaveLobby");
-
-        var starting = WaitForPushAsync<MatchStartingConfig>(bob, "MatchStarting", c => c.ServerId == serverId);
-        await bob.InvokeAsync("HostStart");
-        await starting;
-    }
-
-    [Fact]
-    public async Task HostStart_NonHost_ThrowsHubException()
-    {
-        var (factory, client) = CreateFactory();
-        var aliceToken = await AuthGuestAsync(client);
-        var bobToken = await AuthGuestAsync(client);
-        var serverId = await RegisterServerAsync(client);
-
-        var alice = await ConnectAsync(factory, aliceToken);
-        var bob = await ConnectAsync(factory, bobToken);
-
-        await alice.InvokeAsync("JoinLobby", serverId); // Alice is host (first joiner)
-        await bob.InvokeAsync("JoinLobby", serverId);
-
-        await Assert.ThrowsAsync<HubException>(() => bob.InvokeAsync("HostStart"));
-    }
-
-    [Fact]
-    public async Task JoinLobby_FullLobby_RejectsThirdPlayer()
-    {
-        // Capacity 2: only three real connections are needed to exercise the
-        // rejection; the capacity state-machine rule itself is covered
-        // exhaustively (0/1/exact/over) in LobbyManagerTests.
-        var (factory, client) = CreateFactory(maxPlayersPerLobby: 2);
-        var aliceToken = await AuthGuestAsync(client);
-        var bobToken = await AuthGuestAsync(client);
-        var carolToken = await AuthGuestAsync(client);
-        var serverId = await RegisterServerAsync(client);
-
-        var alice = await ConnectAsync(factory, aliceToken);
-        var bob = await ConnectAsync(factory, bobToken);
-        var carol = await ConnectAsync(factory, carolToken);
-
-        await alice.InvokeAsync("JoinLobby", serverId);
-        await bob.InvokeAsync("JoinLobby", serverId);
-
-        await Assert.ThrowsAsync<HubException>(() => carol.InvokeAsync("JoinLobby", serverId));
-    }
-
-    [Fact]
-    public async Task StartMatch_AllLockedIn_DeliversAssignedMatchPortAndArena_ViaFakeLauncher()
-    {
-        var (factory, client) = CreateFactory(maxPlayersPerLobby: 2);
-        var aliceToken = await AuthGuestAsync(client);
-        var bobToken = await AuthGuestAsync(client);
-        var serverId = await RegisterServerAsync(client);
-
-        var alice = await ConnectAsync(factory, aliceToken);
-        var bob = await ConnectAsync(factory, bobToken);
-
-        await alice.InvokeAsync("JoinLobby", serverId);
-        await bob.InvokeAsync("JoinLobby", serverId);
-
-        // Character selection: real wire push carries the consumer wire keys
-        // (LobbyPlayer_WireKeys_Pinned_ForClientCodec pins the JSON shape).
-        var characterSelected = WaitForPushAsync<LobbyPlayer>(bob, "CharacterSelected", p => p.Character == "Manki");
-        await alice.InvokeAsync("SelectCharacter", "Manki");
-        var selected = await characterSelected;
-        Assert.Equal("Manki", selected.Character);
-
-        await bob.InvokeAsync("SelectCharacter", "FightGuy");
-        await alice.InvokeAsync("HostStart");
-
-        // No real GameServer process exists — the fake launcher stands in for
-        // the external launch seam and returns a known port/arena, proving
-        // the broadcast carries whatever the launcher assigned.
-        var started = WaitForPushAsync<MatchStartedConfig>(bob, "MatchStarted", c => c.ServerId == serverId);
-        await alice.InvokeAsync("StartMatch");
-        var config = await started;
-
-        Assert.Equal(9877, config.MatchPort);
-        Assert.Equal("TestArena", config.ArenaName);
-        Assert.Equal(2, config.Players.Count);
+        // Exactly 4 PlayerJoined broadcasts — the rejected join adds none.
+        harness.GroupProxy.Verify(
+            p => p.SendCoreAsync("PlayerJoined", It.IsAny<object[]>(), default),
+            Times.Exactly(4));
+        harness.Groups.Verify(
+            g => g.AddToGroupAsync("c4", GroupName(ServerId), default),
+            Times.Never);
     }
 
     [Fact]
     public void LobbyPlayer_WireKeys_Pinned_ForClientCodec()
     {
-        // Issue #7: the C# properties are Username/Character, but the wire
-        // keys must stay `name`/`characterSelection` — the client (SlopArena
-        // repo) parses those exact keys in LobbyPayloadCodec, so the wire
-        // cannot change until both repos ship in lockstep.
+        // Issue #7: the C# properties are Username/Character, but the wire keys
+        // must stay `name`/`characterSelection` — the client (SlopArena repo)
+        // parses those exact keys in LobbyPayloadCodec. Serialize with the same
+        // camelCase policy SignalR's JSON hub protocol uses.
         var player = new LobbyPlayer(101, "Alice", "Manki", true, true, 1);
 
-        var json = JsonSerializer.Serialize(player, new JsonSerializerOptions
-        {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-        });
+        var json = System.Text.Json.JsonSerializer.Serialize(
+            player,
+            new System.Text.Json.JsonSerializerOptions
+            {
+                PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase
+            });
 
-        using var doc = JsonDocument.Parse(json);
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
         Assert.Equal("Alice", doc.RootElement.GetProperty("name").GetString());
         Assert.Equal("Manki", doc.RootElement.GetProperty("characterSelection").GetString());
         Assert.Equal(101, doc.RootElement.GetProperty("steamId").GetInt64());

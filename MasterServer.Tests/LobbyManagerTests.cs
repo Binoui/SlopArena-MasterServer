@@ -59,7 +59,7 @@ public class LobbyManagerTests
         mgr.JoinLobby(ServerA, "c1", 101, "Alice");
         mgr.JoinLobby(ServerA, "c2", 202, "Bob");
 
-        var result = mgr.LeaveLobby("c2");
+        var result = mgr.LeaveLobby("c2", 202);
 
         Assert.Equal(ServerA, result.ServerId);
         Assert.NotNull(result.Player);
@@ -73,7 +73,7 @@ public class LobbyManagerTests
         var mgr = new LobbyManager();
         mgr.JoinLobby(ServerA, "c1", 101, "Alice");
 
-        mgr.LeaveLobby("c1");
+        mgr.LeaveLobby("c1", 101);
 
         // Re-joining after the lobby was reaped starts fresh → first player is host again.
         var rejoin = mgr.JoinLobby(ServerA, "c1", 101, "Alice");
@@ -88,7 +88,7 @@ public class LobbyManagerTests
         mgr.JoinLobby(ServerA, "c2", 202, "Bob");
 
         // Alice (host) leaves — Bob should be promoted.
-        mgr.LeaveLobby("c1");
+        mgr.LeaveLobby("c1", 101);
 
         var snapshot = mgr.GetSnapshot("c2");
         Assert.NotNull(snapshot);
@@ -102,7 +102,7 @@ public class LobbyManagerTests
     {
         var mgr = new LobbyManager();
 
-        var result = mgr.LeaveLobby("nobody");
+        var result = mgr.LeaveLobby("nobody", 999);
 
         Assert.Null(result.ServerId);
         Assert.Null(result.Player);
@@ -115,7 +115,7 @@ public class LobbyManagerTests
         var mgr = new LobbyManager();
         mgr.JoinLobby(ServerA, "c1", 101, "Alice");
 
-        var result = mgr.LeaveLobby("c1");
+        var result = mgr.LeaveLobby("c1", 101);
 
         Assert.Equal(ServerA, result.ServerId);
         Assert.Null(result.Snapshot);
@@ -185,7 +185,7 @@ public class LobbyManagerTests
         var mgr = new LobbyManager();
         mgr.JoinLobby(ServerA, "c1", 101, "Alice");
         mgr.JoinLobby(ServerA, "c2", 202, "Bob");
-        mgr.LeaveLobby("c1"); // Alice leaves → Bob promoted.
+        mgr.LeaveLobby("c1", 101); // Alice leaves → Bob promoted.
 
         var result = mgr.TryHostStart("c2");
 
@@ -321,7 +321,7 @@ public class LobbyManagerTests
         mgr.SelectCharacter("c1", "Manki");
         mgr.SelectCharacter("c2", "FightGuy");
 
-        var result = mgr.TryStartMatch("c1");
+        var result = mgr.TryStartMatch("c1", "training");
 
         Assert.True(result.Success);
         Assert.Null(result.Error);
@@ -329,6 +329,7 @@ public class LobbyManagerTests
         Assert.Equal(ServerA, result.Config!.ServerId);
         Assert.Equal(2, result.Config.Players.Count);
         Assert.True(result.Config.Players.All(p => p.LockedIn));
+        Assert.Equal("training", result.Config.ArenaName);
     }
 
     [Fact]
@@ -340,7 +341,7 @@ public class LobbyManagerTests
         mgr.SelectCharacter("c1", "Manki");
         // Bob hasn't locked in.
 
-        var result = mgr.TryStartMatch("c1");
+        var result = mgr.TryStartMatch("c1", "training");
 
         Assert.False(result.Success);
         Assert.Null(result.Config);
@@ -354,7 +355,7 @@ public class LobbyManagerTests
         mgr.JoinLobby(ServerA, "c1", 101, "Alice");
         mgr.SelectCharacter("c1", "Manki");
 
-        var result = mgr.TryStartMatch("c1");
+        var result = mgr.TryStartMatch("c1", "training");
 
         Assert.False(result.Success);
         Assert.Contains("at least 2", result.Error, StringComparison.OrdinalIgnoreCase);
@@ -369,7 +370,7 @@ public class LobbyManagerTests
         mgr.SelectCharacter("c1", "Manki");
         mgr.SelectCharacter("c2", "FightGuy");
 
-        var result = mgr.TryStartMatch("c2");
+        var result = mgr.TryStartMatch("c2", "training");
 
         Assert.False(result.Success);
         Assert.Contains("host", result.Error, StringComparison.OrdinalIgnoreCase);
@@ -380,10 +381,61 @@ public class LobbyManagerTests
     {
         var mgr = new LobbyManager();
 
-        var result = mgr.TryStartMatch("nobody");
+        var result = mgr.TryStartMatch("nobody", "training");
 
         Assert.False(result.Success);
         Assert.Contains("not in a lobby", result.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void TryStartMatch_EmptyArena_Fails()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+        mgr.SelectCharacter("c1", "Manki");
+        mgr.SelectCharacter("c2", "FightGuy");
+
+        var result = mgr.TryStartMatch("c1", "");
+
+        Assert.False(result.Success);
+        Assert.Contains("arena", result.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ── IsAllLockedIn (stage select gate) ──
+
+    [Fact]
+    public void IsAllLockedIn_AllLocked_True()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+        mgr.SelectCharacter("c1", "Manki");
+        mgr.SelectCharacter("c2", "FightGuy");
+
+        Assert.True(mgr.IsAllLockedIn("c1", out var error));
+        Assert.Null(error);
+    }
+
+    [Fact]
+    public void IsAllLockedIn_UnlockedPlayer_False()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.JoinLobby(ServerA, "c2", 202, "Bob");
+        mgr.SelectCharacter("c1", "Manki");
+
+        Assert.False(mgr.IsAllLockedIn("c1", out var error));
+        Assert.Contains("lock", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void IsAllLockedIn_NoLobby_False()
+    {
+        var mgr = new LobbyManager();
+
+        Assert.False(mgr.IsAllLockedIn("nobody", out var error));
+        Assert.Contains("not in a lobby", error, StringComparison.OrdinalIgnoreCase);
     }
 
     // ── Player-count contract (issue #6): max 4 per lobby, min 2 to start ──
@@ -424,21 +476,61 @@ public class LobbyManagerTests
     }
 
     [Fact]
-    public void JoinLobby_FullTarget_LeavesPreviousLobbyIntact()
+    public void JoinLobby_FullTarget_AdmitsServerChatAndSwitchesMembership()
     {
         var mgr = new LobbyManager();
         mgr.JoinLobby(ServerA, "c1", 101, "Alice");
         for (int i = 0; i < 4; i++)
             mgr.JoinLobby(ServerB, $"b{i}", 200 + i, $"B{i}");
 
-        // c1 (in ServerA) tries to switch to the full ServerB lobby.
+        // Waiting capacity is separate from authoritative Server Chat
+        // membership. A full target reports lobby_full but admits c1 to B.
         var result = mgr.JoinLobby(ServerB, "c1", 101, "Alice");
 
         Assert.False(result.Success);
-        Assert.Null(result.Departure);
-        // c1 is still in ServerA — the rejected join must not evict them.
-        Assert.Equal(ServerA, mgr.GetSnapshot("c1")!.ServerId);
-        Assert.Single(mgr.GetSnapshot("c1")!.Players);
+        Assert.True(result.ServerAdmitted);
+        Assert.Contains("full", result.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(ServerB, mgr.GetServerId("c1"));
+        Assert.Equal(ServerA, result.Departure!.ServerId);
+    }
+
+    [Fact]
+    public void DisconnectThenResumeServer_RestoresChatOnlyWithoutWaitingRoster()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.SelectCharacter("c1", "Manki");
+        mgr.DisconnectConnection("c1");
+
+        Assert.True(mgr.ResumeServer(ServerA, "c2", 101, "Alice", out var error));
+        Assert.Null(error);
+        Assert.Equal(ServerA, mgr.GetServerId("c2"));
+        Assert.Null(mgr.GetSnapshot("c2"));
+    }
+
+    [Fact]
+    public void LeaveLobby_ClearsResumeAdmission()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.LeaveLobby("c1", 101);
+
+        Assert.False(mgr.ResumeServer(ServerA, "c2", 101, "Alice", out var error));
+        Assert.Equal("not_admitted", error);
+    }
+
+    [Fact]
+    public void DisconnectThenFreshConnectionLeave_ClearsResumeAdmission()
+    {
+        var mgr = new LobbyManager();
+        mgr.JoinLobby(ServerA, "c1", 101, "Alice");
+        mgr.DisconnectConnection("c1");
+
+        var departure = mgr.LeaveLobby("c2", 101);
+
+        Assert.Null(departure.ServerId);
+        Assert.False(mgr.ResumeServer(ServerA, "c3", 101, "Alice", out var error));
+        Assert.Equal("not_admitted", error);
     }
 
     [Fact]
@@ -464,7 +556,7 @@ public class LobbyManagerTests
         for (int i = 0; i < 4; i++)
             mgr.SelectCharacter($"c{i}", "Manki");
 
-        var result = mgr.TryStartMatch("c0");
+        var result = mgr.TryStartMatch("c0", "training");
 
         Assert.True(result.Success);
         Assert.Equal(4, result.Config!.Players.Count);

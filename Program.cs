@@ -570,4 +570,3 @@ app.Run();
 
 // Exposed for the test host (WebApplicationFactory<Program>).
 public partial class Program { }
-

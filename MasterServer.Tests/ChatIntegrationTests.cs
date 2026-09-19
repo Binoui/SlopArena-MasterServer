@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using MasterServer.Chat;
+using MasterServer.Lobbies;
 using MasterServer.Data;
 using MasterServer.DTOs;
 using Microsoft.AspNetCore.Http.Connections;
@@ -43,6 +44,13 @@ public class ChatIntegrationTests : IDisposable
     }
 
     private sealed record ServerRegisterResponse(Guid ServerId, string ApiToken);
+    private sealed class FakeMatchLauncher : IMatchLauncher
+    {
+        public Task<MatchLaunchResult> LaunchAsync(MatchStartedConfig config)
+            => Task.FromResult(new MatchLaunchResult(
+                9877,
+                JsonDocument.Parse("""{"schemaVersion":1,"entries":[]}""").RootElement.Clone()));
+    }
 
     private (WebApplicationFactory<Program> Factory, HttpClient Client, ManualTimeProvider Clock) CreateFactory(int httpRateLimit = 100_000)
     {
@@ -54,11 +62,15 @@ public class ChatIntegrationTests : IDisposable
             {
                 ["RateLimit:MaxRequestsPerWindow"] = httpRateLimit.ToString(),
             }));
-
             builder.ConfigureServices(services =>
             {
                 Replace<DbContextOptions<AppDbContext>>(services);
                 services.AddDbContext<AppDbContext>(opts => opts.UseInMemoryDatabase(databaseName));
+
+                // Replace only the external GameServer launch boundary. The
+                // SignalR path and lobby/membership state remain real.
+                Replace<IMatchLauncher>(services);
+                services.AddSingleton<IMatchLauncher, FakeMatchLauncher>();
 
                 // Deterministic clock for the 5/5s message quota, 20/10s
                 // control budget, and any backlog-eviction timing — no
@@ -670,6 +682,33 @@ public class ChatIntegrationTests : IDisposable
             player => player.PlayerId == profile.PlayerId);
     }
 
+
+    [Fact]
+    public async Task ResumeServer_RevalidatesPriorAdmissionWithoutWaitingRoster()
+    {
+        var (factory, client, _) = CreateFactory();
+        var serverA = await RegisterFreshServerAsync(client, "Resume-A");
+        var (token, _) = await RegisterPlayerAsync(client, "Resume");
+        var first = await ConnectAsync(factory, token);
+        await first.InvokeAsync("JoinLobby", serverA);
+        await first.DisposeAsync();
+
+        var resumed = await ConnectAsync(factory, token);
+        var state = WaitForPushAsync<ServerChatState>(
+            resumed, "ChatServerChanged", snapshot => snapshot.ServerId == serverA);
+        await resumed.InvokeAsync("ResumeServer", serverA);
+        Assert.Equal(serverA, (await state).ServerId);
+        await Assert.ThrowsAsync<HubException>(() => resumed.InvokeAsync("HostStart"));
+        var accepted = await resumed.InvokeAsync<ChatMessage>(
+            "SendServer", serverA, "resume retains chat only");
+        Assert.Equal(serverA, accepted.ServerId);
+
+        await resumed.InvokeAsync("LeaveLobby");
+        var afterLeave = await ConnectAsync(factory, token);
+        var rejected = await Assert.ThrowsAsync<HubException>(
+            () => afterLeave.InvokeAsync("ResumeServer", serverA));
+        Assert.Contains("not_admitted", rejected.Message);
+    }
     [Fact]
     public async Task ServerHistoryCapacity_EvictsAnIdleChannelButPreservesAnActiveOne()
     {
@@ -732,5 +771,76 @@ public class ChatIntegrationTests : IDisposable
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
         using var rename = await SetDisplayNameRawAsync(client, expired, "Rejected");
         Assert.Equal(HttpStatusCode.Unauthorized, rename.StatusCode);
+    }
+
+    [Fact]
+    public async Task ServerChat_UsesGameServerMembershipAcrossMatchesAndFullWaitingRoster()
+    {
+        var (factory, client, _) = CreateFactory();
+        var serverA = await RegisterFreshServerAsync(client, "Shared-A");
+        var serverB = await RegisterFreshServerAsync(client, "Stranger-B");
+
+        async Task<HubConnection> NewPlayer(string name)
+        {
+            var (token, _) = await RegisterPlayerAsync(client, name);
+            var connection = await ConnectAsync(factory, token);
+            return connection;
+        }
+
+        // Four players launch a real hub match. MatchStarted releases their
+        // waiting-roster slots but retains each authoritative Server membership.
+        var fighters = new HubConnection[4];
+        for (var i = 0; i < fighters.Length; i++)
+        {
+            fighters[i] = await NewPlayer($"Fighter-{i}");
+            await fighters[i].InvokeAsync("JoinLobby", serverA);
+        }
+        for (var i = 0; i < fighters.Length; i++)
+            await fighters[i].InvokeAsync("SelectCharacter", "Manki");
+        await fighters[0].InvokeAsync("StartStageSelect");
+        await fighters[0].InvokeAsync("StartMatch", "training");
+
+        // Fill a fresh waiting roster on the same GameServer, then prove a
+        // fifth waiting join is still admitted to Server Chat but not the
+        // roster. The caller sees both the honest lobby_full error and its
+        // authoritative ChatServerChanged state.
+        var waiting = new HubConnection[4];
+        for (var i = 0; i < waiting.Length; i++)
+        {
+            waiting[i] = await NewPlayer($"Waiting-{i}");
+            await waiting[i].InvokeAsync("JoinLobby", serverA);
+        }
+        var full = await NewPlayer("Full-Roster");
+        var fullState = WaitForPushAsync<ServerChatState>(
+            full, "ChatServerChanged", state => state.ServerId == serverA);
+        var fullError = await Assert.ThrowsAsync<HubException>(
+            () => full.InvokeAsync("JoinLobby", serverA));
+        Assert.Contains("lobby_full", fullError.Message);
+        Assert.Equal(serverA, (await fullState).ServerId);
+
+        // The waiting four launch a second match on the same GameServer. Both
+        // match groups and the waiting-only/full connections must share one
+        // Server Chat audience, while another GameServer remains private.
+        for (var i = 0; i < waiting.Length; i++)
+            await waiting[i].InvokeAsync("SelectCharacter", "FightGuy");
+        await waiting[0].InvokeAsync("StartStageSelect");
+        await waiting[0].InvokeAsync("StartMatch", "training");
+
+        var stranger = await NewPlayer("Other-Server");
+        await stranger.InvokeAsync("JoinLobby", serverB);
+        var serverAMembers = fighters.Concat(waiting).Append(full).ToArray();
+        var received = serverAMembers
+            .Select(connection => WaitForPushAsync<ChatMessage>(
+                connection, "ChatMessage", message => message.Channel == "server"
+                    && message.ServerId == serverA))
+            .ToArray();
+        var strangerMessages = new ConcurrentQueue<ChatMessage>();
+        using var strangerRegistration = stranger.On<ChatMessage>("ChatMessage", strangerMessages.Enqueue);
+
+        var sent = await fighters[0].InvokeAsync<ChatMessage>(
+            "SendServer", serverA, "one GameServer across waiting and matches");
+        Assert.All(await Task.WhenAll(received), message => Assert.Equal(sent.MessageId, message.MessageId));
+        await Task.Delay(100);
+        Assert.DoesNotContain(strangerMessages, message => message.MessageId == sent.MessageId);
     }
 }
