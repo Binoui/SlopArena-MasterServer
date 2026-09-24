@@ -1,0 +1,125 @@
+name: Container images
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Operator release identity (no latest)
+        required: true
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  images:
+    if: github.event_name == 'release' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      app_digest: ${{ steps.publish.outputs.app_digest }}
+      migration_digest: ${{ steps.publish.outputs.migration_digest }}
+      source_revision: ${{ github.sha }}
+      runtime: mcr.microsoft.com/dotnet/sdk:8.0.425-bookworm-slim; mcr.microsoft.com/dotnet/aspnet:8.0.31-bookworm-slim; mcr.microsoft.com/dotnet/runtime-deps:8.0.31-bookworm-slim; linux/amd64
+      release_identity: ${{ steps.meta.outputs.id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Test
+        run: dotnet test MasterServer.Tests/MasterServer.Tests.csproj --verbosity minimal
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Identify release
+        id: meta
+        env:
+          INPUT_ID: ${{ inputs.release_id }}
+          REF_ID: ${{ github.event.release.tag_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          id="${REF_ID:-$INPUT_ID}"
+          if [[ ! "$id" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$ ]]; then
+            echo 'Invalid release identity' >&2
+            exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Linux amd64 images locally
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          RELEASE_ID: ${{ steps.meta.outputs.id }}
+        run: |
+          docker buildx build --platform linux/amd64 --load --target master \
+            --build-arg SOURCE_REVISION="$GITHUB_SHA" --build-arg RELEASE_ID="$RELEASE_ID" \
+            -t "$IMAGE:sha-$GITHUB_SHA" .
+          docker buildx build --platform linux/amd64 --load --target migrations \
+            --build-arg SOURCE_REVISION="$GITHUB_SHA" --build-arg RELEASE_ID="$RELEASE_ID" \
+            -t "$IMAGE-migrations:sha-$GITHUB_SHA" .
+
+      - name: Smoke app and migration images before publishing
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          name="master-smoke-$GITHUB_RUN_ID"
+          cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run -d --name "$name" --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            -e ASPNETCORE_HTTP_PORTS=8080 \
+            -e Jwt__Secret=smoke-only-not-a-production-secret-0123456789abcdef \
+            -e ConnectionStrings__DefaultConnection='Host=127.0.0.1;Port=1;Database=smoke;Username=smoke;Password=smoke;Timeout=1' \
+            -p 127.0.0.1:18080:8080 "$IMAGE:sha-$GITHUB_SHA"
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:18080/health; then
+              break
+            fi
+            if [[ "$attempt" == 30 ]]; then
+              docker logs "$name"
+              exit 1
+            fi
+            sleep 1
+          done
+          docker run --rm --read-only --tmpfs /tmp:rw,uid=1654,gid=1654,size=128m \
+            "$IMAGE-migrations:sha-$GITHUB_SHA" --help
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Push only after tests and smoke
+        id: publish
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          RELEASE_ID: ${{ steps.meta.outputs.id }}
+        run: |
+          docker tag "$IMAGE:sha-$GITHUB_SHA" "$IMAGE:$RELEASE_ID"
+          docker tag "$IMAGE-migrations:sha-$GITHUB_SHA" "$IMAGE-migrations:$RELEASE_ID"
+          docker push "$IMAGE:sha-$GITHUB_SHA"
+          docker push "$IMAGE:$RELEASE_ID"
+          docker push "$IMAGE-migrations:sha-$GITHUB_SHA"
+          docker push "$IMAGE-migrations:$RELEASE_ID"
+          app_ref="$(docker image inspect "$IMAGE:sha-$GITHUB_SHA" --format '{{index .RepoDigests 0}}')"
+          migrations_ref="$(docker image inspect "$IMAGE-migrations:sha-$GITHUB_SHA" --format '{{index .RepoDigests 0}}')"
+          app_digest="${app_ref##*@}"
+          migration_digest="${migrations_ref##*@}"
+          test -n "$app_digest" && test -n "$migration_digest"
+          echo "app_digest=$app_digest" >> "$GITHUB_OUTPUT"
+          echo "migration_digest=$migration_digest" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Published Master images'
+            echo "- Master: \`$IMAGE@$app_digest\`"
+            echo "- Migrations: \`$IMAGE-migrations@$migration_digest\`"
+            echo "- Source revision: \`$GITHUB_SHA\`"
+            echo '- Runtime: SDK 8.0.425-bookworm-slim; ASP.NET 8.0.31-bookworm-slim; runtime-deps 8.0.31-bookworm-slim; linux/amd64; PostgreSQL 15 target'
+            echo "- Release identity: \`$RELEASE_ID\`"
+          } >> "$GITHUB_STEP_SUMMARY"

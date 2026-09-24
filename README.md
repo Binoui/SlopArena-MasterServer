@@ -62,6 +62,37 @@ export ConnectionStrings__DefaultConnection="Host=your-host;Database=sloparena;.
 dotnet run
 ```
 
+## Container release and migrations
+
+The `Container images` workflow tests and publishes only for a manual dispatch
+from `main` or a published GitHub release. Manual dispatch requires a `release_id`
+matching `[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}`. It publishes independent Linux amd64
+images to GHCR: the ASP.NET Core 8 application and a self-contained EF migration
+runner built from the same source revision. The images use SDK
+`8.0.425-bookworm-slim` and ASP.NET/runtime-deps
+`8.0.31-bookworm-slim`; migrations target PostgreSQL 15. The workflow summary
+reports immutable image digests, source revision, exact runtime, and release
+identity. Deploy by digest rather than a tag.
+
+Supply `Jwt__Secret` and `ConnectionStrings__DefaultConnection` through the
+deployment platform's secret/configuration mechanism; neither local settings
+nor secrets are included in the images. The application listens on port 8080
+and does not apply migrations during startup. Run migrations separately before
+deploying the application, passing the connection as an environment secret:
+
+```bash
+docker run --rm --platform linux/amd64 --read-only \
+  --tmpfs /tmp:rw,uid=1654,gid=1654,size=128m \
+  --env ConnectionStrings__DefaultConnection \
+  "ghcr.io/binoui/sloparena-masterserver-migrations@${MIGRATION_DIGEST}"
+```
+
+The self-contained EF bundle extracts to `/tmp/bundle`; the bounded tmpfs is
+the only writable path. The migration runner reads the connection variable
+without putting it in its command line. Then run the application image by
+its reported digest, supplying `Jwt__Secret` and
+`ConnectionStrings__DefaultConnection` externally and publishing port 8080.
+
 ## Architecture
 
 ```
