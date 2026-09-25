@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Http.Json;
 using MasterServer.Data;
 using MasterServer.Data.Models;
+using MasterServer.Configuration;
 using MasterServer.Lobbies;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -39,11 +40,13 @@ public class HttpMatchLauncherTests
         public string RequestBody { get; private set; } = "";
         public Uri? RequestUri { get; private set; }
         public HttpStatusCode Status { get; set; } = HttpStatusCode.OK;
+        public System.Net.Http.Headers.AuthenticationHeaderValue? Authorization { get; private set; }
         public string ResponseBody { get; set; } = """{"port":9877,"content":{"schemaVersion":1,"entries":[]}}""";
 
         protected override Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request, CancellationToken ct)
         {
+            Authorization = request.Headers.Authorization;
             RequestUri = request.RequestUri;
             RequestBody = request.Content is null
                 ? ""
@@ -72,6 +75,10 @@ public class HttpMatchLauncherTests
         return db;
     }
 
+    private static HttpMatchLauncher CreateLauncher(
+        AppDbContext db, HttpClient http, MasterDeploymentOptions deployment) =>
+        new(db, NullLogger<HttpMatchLauncher>.Instance, http, deployment);
+
     private static List<LobbyPlayer> TwoPlayerRoster() => new()
     {
         new LobbyPlayer(101, "Alice", "Manki", true, true, 1),
@@ -88,7 +95,7 @@ public class HttpMatchLauncherTests
     {
         var handler = new StubHandler();
         var db = SeedServer("127.0.0.1", 9876);
-        var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
+        var launcher = CreateLauncher(db, new HttpClient(handler), MasterDeploymentOptions.Development);
 
         var config = new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court");
         var launch = await launcher.LaunchAsync(config);
@@ -97,6 +104,7 @@ public class HttpMatchLauncherTests
         Assert.Equal(JsonValueKind.Object, launch.Content.ValueKind);
         Assert.Equal(1, launch.Content.GetProperty("schemaVersion").GetInt32());
         Assert.Equal("http://127.0.0.1:9876/match/start", handler.RequestUri!.ToString());
+        Assert.Null(handler.Authorization);
 
         var body = System.Text.Json.JsonDocument.Parse(handler.RequestBody);
         var players = body.RootElement.GetProperty("players");
@@ -122,11 +130,50 @@ public class HttpMatchLauncherTests
     }
 
     [Fact]
+    public async Task LaunchAsync_VpsUsesPrivateControlUrlAndSeparateBearerKey()
+    {
+        var handler = new StubHandler();
+        var deployment = new MasterDeploymentOptions(
+            "vps",
+            ServerId,
+            "registration-key",
+            "public.example",
+            9876,
+            new Uri("http://gameserver.internal:9876/match/start"),
+            "match-control-key");
+        var launcher = CreateLauncher(
+            SeedServer("attacker.example", 4321), new HttpClient(handler), deployment);
+
+        await launcher.LaunchAsync(new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court"));
+
+        Assert.Equal("http://gameserver.internal:9876/match/start", handler.RequestUri!.ToString());
+        Assert.Equal("Bearer", handler.Authorization!.Scheme);
+        Assert.Equal("match-control-key", handler.Authorization.Parameter);
+    }
+
+    [Fact]
+    public async Task LaunchAsync_VpsRejectsUnapprovedPersistedServerBeforePosting()
+    {
+        var handler = new StubHandler();
+        var db = SeedServer("attacker.example", 4321);
+        var deployment = new MasterDeploymentOptions(
+            "vps", Guid.NewGuid(), "registration-secret-0123456789abcdef",
+            "game.example.com", 9876, new Uri("http://gameserver.internal:9876/match/start"),
+            "control-secret-0123456789abcdef01234567");
+        var launcher = CreateLauncher(db, new HttpClient(handler), deployment);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            launcher.LaunchAsync(new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court")));
+        Assert.Empty(db.Matches);
+        Assert.Null(handler.RequestUri);
+    }
+
+    [Fact]
     public async Task LaunchAsync_RespectsConfigArenaName()
     {
         var handler = new StubHandler();
         var db = SeedServer("10.0.0.5", 7000);
-        var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
+        var launcher = CreateLauncher(db, new HttpClient(handler), MasterDeploymentOptions.Development);
 
         var config = new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "stadium");
         await launcher.LaunchAsync(config);
@@ -139,7 +186,7 @@ public class HttpMatchLauncherTests
     public async Task LaunchAsync_UnknownServer_Throws()
     {
         var db = CreateInMemoryDb(); // no server registered
-        var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(new StubHandler()));
+        var launcher = CreateLauncher(db, new HttpClient(new StubHandler()), MasterDeploymentOptions.Development);
 
         var config = new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court");
 
@@ -151,7 +198,7 @@ public class HttpMatchLauncherTests
     {
         var handler = new StubHandler { Status = HttpStatusCode.BadRequest };
         var db = SeedServer("127.0.0.1", 9876);
-        var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
+        var launcher = CreateLauncher(db, new HttpClient(handler), MasterDeploymentOptions.Development);
 
         var config = new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court");
 
@@ -163,7 +210,7 @@ public class HttpMatchLauncherTests
     {
         var handler = new StubHandler { ResponseBody = """{"port":0}""" };
         var db = SeedServer("127.0.0.1", 9876);
-        var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
+        var launcher = CreateLauncher(db, new HttpClient(handler), MasterDeploymentOptions.Development);
 
         var config = new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court");
 
@@ -176,7 +223,7 @@ public class HttpMatchLauncherTests
         // Issue #40: a failed launch must not leave an orphan Match row.
         var handler = new StubHandler { Status = HttpStatusCode.InternalServerError };
         var db = SeedServer("127.0.0.1", 9876);
-        var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
+        var launcher = CreateLauncher(db, new HttpClient(handler), MasterDeploymentOptions.Development);
 
         var config = new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court");
 
@@ -191,7 +238,7 @@ public class HttpMatchLauncherTests
     {
         var handler = new StubHandler();
         var db = SeedServer("127.0.0.1", 9876);
-        var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
+        var launcher = CreateLauncher(db, new HttpClient(handler), MasterDeploymentOptions.Development);
 
         var config = new MatchStartedConfig(ServerId, Roster(5), 0, "slop_court");
 
@@ -207,7 +254,7 @@ public class HttpMatchLauncherTests
     {
         var handler = new StubHandler();
         var db = SeedServer("127.0.0.1", 9876);
-        var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
+        var launcher = CreateLauncher(db, new HttpClient(handler), MasterDeploymentOptions.Development);
 
         var config = new MatchStartedConfig(ServerId, Roster(1), 0, "slop_court");
 
@@ -222,7 +269,7 @@ public class HttpMatchLauncherTests
     {
         var handler = new StubHandler();
         var db = SeedServer("127.0.0.1", 9876);
-        var launcher = new HttpMatchLauncher(db, NullLogger<HttpMatchLauncher>.Instance, new HttpClient(handler));
+        var launcher = CreateLauncher(db, new HttpClient(handler), MasterDeploymentOptions.Development);
 
         var config = new MatchStartedConfig(ServerId, Roster(4), 0, "slop_court");
         var launch = await launcher.LaunchAsync(config);

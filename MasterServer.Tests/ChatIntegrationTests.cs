@@ -60,6 +60,7 @@ public class ChatIntegrationTests : IDisposable
         {
             builder.ConfigureAppConfiguration((_, config) => config.AddInMemoryCollection(new Dictionary<string, string?>
             {
+                ["Deployment:Profile"] = "development",
                 ["RateLimit:MaxRequestsPerWindow"] = httpRateLimit.ToString(),
             }));
             builder.ConfigureServices(services =>

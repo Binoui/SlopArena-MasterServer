@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Globalization;
 using System.Threading.RateLimiting;
 using MasterServer.Chat;
+using MasterServer.Configuration;
 using Microsoft.EntityFrameworkCore;
 using MasterServer.Data;
 using MasterServer.DTOs;
@@ -17,6 +18,7 @@ using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.AspNetCore.SignalR;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddSingleton(sp => MasterDeploymentOptions.Load(sp.GetRequiredService<IConfiguration>()));
 
 // Service registration expands during subsequent tasks
 builder.Services.AddDbContext<AppDbContext>(options =>
@@ -92,9 +94,9 @@ builder.Services.AddSingleton<LobbyManager>();
 builder.Services.AddHttpClient<IMatchLauncher, HttpMatchLauncher>();
 builder.Services.AddAuthorization();
 
-var rateLimitMax = builder.Configuration.GetValue("RateLimit:MaxRequestsPerWindow", 10);
 builder.Services.AddRateLimiter(options =>
 {
+    var rateLimitMax = builder.Configuration.GetValue("RateLimit:MaxRequestsPerWindow", 10);
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
     options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
     {
@@ -128,6 +130,8 @@ builder.Services.AddRateLimiter(options =>
 });
 
 var app = builder.Build();
+// Validate the selected deployment profile before any listener accepts requests.
+_ = app.Services.GetRequiredService<MasterDeploymentOptions>();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
 
 app.MapGet("/health", () => new { status = "ok", version = "0.1.0" });
@@ -174,6 +178,9 @@ static bool TimingSafeEquals(string a, string b)
         System.Text.Encoding.UTF8.GetBytes(a),
         System.Text.Encoding.UTF8.GetBytes(b));
 }
+
+static string GenerateServerApiToken() =>
+    Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
 
 // ── Helper: validate server address (IP literal or DNS hostname) ──
 static bool IsValidIpAddress(string ip)
@@ -325,74 +332,89 @@ GuestAuthResponse GenerateGuestAuth(long steamId)
 // ── Game server registration endpoint ──
 app.MapPost("/servers/register", async (
     ServerRegistrationRequest request,
-    AppDbContext db) =>
+    HttpContext httpContext,
+    AppDbContext db,
+    MasterDeploymentOptions deployment) =>
 {
-    // Input validation
+    if (deployment.IsVps)
+    {
+        var registrationToken = ExtractBearerToken(httpContext, logger);
+        if (registrationToken is null
+            || !TimingSafeEquals(deployment.RegistrationKey!, registrationToken)
+            || request.HostId != deployment.ApprovedHostId)
+            return Results.Unauthorized();
+    }
+
     if (string.IsNullOrWhiteSpace(request.Name))
         return Results.BadRequest(new { error = "Name is required" });
 
     if (string.IsNullOrWhiteSpace(request.Region))
         return Results.BadRequest(new { error = "Region is required" });
 
-    if (!IsValidIpAddress(request.IpAddress))
-        return Results.BadRequest(new { error = $"Invalid IP address: {request.IpAddress}" });
+    var ipAddress = deployment.IsVps ? deployment.PublicHost! : request.IpAddress;
+    var port = deployment.IsVps ? deployment.PublicPort!.Value : request.Port;
+    var isOfficial = deployment.IsVps || request.IsOfficial;
+    if (!deployment.IsVps && !IsValidIpAddress(ipAddress))
+        return Results.BadRequest(new { error = $"Invalid IP address: {ipAddress}" });
 
-    if (!IsValidPort(request.Port))
-        return Results.BadRequest(new { error = $"Invalid port: {request.Port} (must be 1-65535)" });
+    if (!IsValidPort(port))
+        return Results.BadRequest(new { error = $"Invalid port: {port} (must be 1-65535)" });
 
     if (request.MaxConcurrentMatches <= 0)
         return Results.BadRequest(new { error = "MaxConcurrentMatches must be positive" });
 
     if (request.MaxConcurrentMatches > 100)
         return Results.BadRequest(new { error = "MaxConcurrentMatches must be <= 100" });
+    if (port + request.MaxConcurrentMatches - 1 > 65535)
+        return Results.BadRequest(new { error = "Match port range exceeds 65535" });
 
-    var apiToken = Guid.NewGuid().ToString();
+    var serverId = deployment.IsVps ? deployment.ApprovedHostId!.Value : Guid.NewGuid();
 
-    // Shared refresh path for both the lookup upsert and the lost-registration
-    // race below (issue #49).
     async Task<IResult> Refresh(MasterServer.Data.Models.GameServer target)
     {
         target.Name = request.Name;
+        target.IpAddress = ipAddress;
+        target.Port = port;
         target.Region = request.Region;
-        target.IsOfficial = request.IsOfficial;
+        target.IsOfficial = isOfficial;
         target.MaxConcurrentMatches = request.MaxConcurrentMatches;
-        target.CurrentMatches = 0;
         target.CustomRulesJson = request.CustomRulesJson;
-        target.ApiToken = apiToken; // rotate: the previous process is gone
+        if (!deployment.IsVps)
+        {
+            target.CurrentMatches = 0;
+            target.ApiToken = GenerateServerApiToken();
+        }
         target.LastHeartbeat = DateTime.UtcNow;
 
         await db.SaveChangesAsync();
 
-        logger.LogInformation("Game server re-registered (same IP:port): {Name} (ID: {Id}, IP: {Ip}, Region: {Region})",
-            target.Name, target.Id, target.IpAddress, target.Region);
+        logger.LogInformation(
+            "Game server re-registered: {Name} (ID: {Id}, Region: {Region})",
+            target.Name, target.Id, target.Region);
 
-        return Results.Ok(new { serverId = target.Id, apiToken = apiToken });
+        return Results.Ok(new { serverId = target.Id, apiToken = target.ApiToken });
     }
 
-    // Upsert (issue #49): re-registering the same ip:port reclaims the existing
-    // row instead of inserting a duplicate. Prevents the browser showing two
-    // servers from one host when a game server restarts within the heartbeat
-    // TTL window. (IpAddress alone must NOT be the key — multiple legitimate
-    // servers can share an IP behind NAT or on one official host; the port
-    // disambiguates them.)
-    var existing = await db.GameServers.FirstOrDefaultAsync(s =>
-        s.IpAddress == request.IpAddress && s.Port == request.Port);
-
+    // VPS identity is the provisioned primary key, never a request address.
+    // Development keeps its explicit legacy ip:port upsert.
+    var existing = deployment.IsVps
+        ? await db.GameServers.FindAsync(serverId)
+        : await db.GameServers.FirstOrDefaultAsync(s => s.IpAddress == ipAddress && s.Port == port);
     if (existing is not null)
         return await Refresh(existing);
 
     var gameServer = new MasterServer.Data.Models.GameServer
     {
-        Id = Guid.NewGuid(),
+        Id = serverId,
         Name = request.Name,
-        IpAddress = request.IpAddress,
-        Port = request.Port,
+        IpAddress = ipAddress,
+        Port = port,
         Region = request.Region,
-        IsOfficial = request.IsOfficial,
+        IsOfficial = isOfficial,
         MaxConcurrentMatches = request.MaxConcurrentMatches,
         CurrentMatches = 0,
         CustomRulesJson = request.CustomRulesJson,
-        ApiToken = apiToken,
+        ApiToken = GenerateServerApiToken(),
         LastHeartbeat = DateTime.UtcNow
     };
 
@@ -404,23 +426,22 @@ app.MapPost("/servers/register", async (
     }
     catch (DbUpdateException)
     {
-        // Lost a registration race on the same fresh ip:port: the unique index
-        // rejected our insert, so reclaim the winner's row instead of a 500.
-        var winner = await db.GameServers.FirstOrDefaultAsync(s =>
-            s.IpAddress == request.IpAddress && s.Port == request.Port);
+        // The primary key arbitrates concurrent VPS inserts; ip:port does so in
+        // development. Re-read the winner and return its stable API token.
+        db.Entry(gameServer).State = EntityState.Detached;
+        var winner = deployment.IsVps
+            ? await db.GameServers.FindAsync(serverId)
+            : await db.GameServers.FirstOrDefaultAsync(s => s.IpAddress == ipAddress && s.Port == port);
         if (winner is null)
-            throw; // row gone concurrently; surface the original failure
+            throw;
         return await Refresh(winner);
     }
 
-    logger.LogInformation("Game server registered: {Name} (ID: {Id}, IP: {Ip}, Region: {Region})",
-        gameServer.Name, gameServer.Id, gameServer.IpAddress, gameServer.Region);
+    logger.LogInformation(
+        "Game server registered: {Name} (ID: {Id}, Region: {Region})",
+        gameServer.Name, gameServer.Id, gameServer.Region);
 
-    return Results.Ok(new
-    {
-        serverId = gameServer.Id,
-        apiToken = apiToken
-    });
+    return Results.Ok(new { serverId = gameServer.Id, apiToken = gameServer.ApiToken });
 });
 
 // ── Server heartbeat endpoint ──
@@ -428,7 +449,8 @@ app.MapPost("/servers/{serverId}/heartbeat", async (
     Guid serverId,
     HeartbeatRequest request,
     HttpContext httpContext,
-    AppDbContext db) =>
+    AppDbContext db,
+    MasterDeploymentOptions deployment) =>
 {
     var token = ExtractBearerToken(httpContext, logger);
     if (token == null)
@@ -441,7 +463,8 @@ app.MapPost("/servers/{serverId}/heartbeat", async (
         return Results.NotFound(new { error = "Server not found" });
     }
 
-    if (!TimingSafeEquals(server.ApiToken, token))
+    if ((deployment.IsVps && server.Id != deployment.ApprovedHostId) ||
+        !TimingSafeEquals(server.ApiToken, token))
     {
         logger.LogWarning("Heartbeat auth failed for server {ServerId}", serverId);
         return Results.Unauthorized();
@@ -461,7 +484,8 @@ app.MapPost("/servers/{serverId}/heartbeat", async (
 app.MapDelete("/servers/{serverId}", async (
     Guid serverId,
     HttpContext httpContext,
-    AppDbContext db) =>
+    AppDbContext db,
+    MasterDeploymentOptions deployment) =>
 {
     var token = ExtractBearerToken(httpContext, logger);
     if (token == null)
@@ -474,7 +498,8 @@ app.MapDelete("/servers/{serverId}", async (
         return Results.NotFound(new { error = "Server not found" });
     }
 
-    if (!TimingSafeEquals(server.ApiToken, token))
+    if ((deployment.IsVps && server.Id != deployment.ApprovedHostId) ||
+        !TimingSafeEquals(server.ApiToken, token))
     {
         logger.LogWarning("Deregister auth failed for server {ServerId}", serverId);
         return Results.Unauthorized();
@@ -488,13 +513,17 @@ app.MapDelete("/servers/{serverId}", async (
 });
 
 // ── Server browser list endpoint (issue #31) ──
-// Returns heartbeat-fresh (< 15s), non-full game servers. Requires a guest JWT.
-app.MapGet("/servers", async (AppDbContext db) =>
+app.MapGet("/servers", async (AppDbContext db, MasterDeploymentOptions deployment) =>
 {
     var cutoff = DateTime.UtcNow.AddSeconds(-15);
-
-    var servers = await db.GameServers
-        .Where(s => s.LastHeartbeat > cutoff && s.CurrentMatches < s.MaxConcurrentMatches)
+    var eligible = db.GameServers
+        .Where(s => s.LastHeartbeat > cutoff && s.CurrentMatches < s.MaxConcurrentMatches);
+    if (deployment.IsVps)
+    {
+        var approvedId = deployment.ApprovedHostId!.Value;
+        eligible = eligible.Where(s => s.Id == approvedId);
+    }
+    var servers = await eligible
         .OrderByDescending(s => s.IsOfficial)
         .ThenBy(s => s.Name)
         .Select(s => new
@@ -517,7 +546,8 @@ app.MapGet("/servers", async (AppDbContext db) =>
 app.MapPost("/match/result", async (
     MatchResultRequest request,
     HttpContext httpContext,
-    AppDbContext db) =>
+    AppDbContext db,
+    MasterDeploymentOptions deployment) =>
 {
     var token = ExtractBearerToken(httpContext, logger);
     if (token == null)
@@ -525,7 +555,8 @@ app.MapPost("/match/result", async (
 
     // Verify server token (find server with this token)
     var server = await db.GameServers.FirstOrDefaultAsync(s => s.ApiToken == token);
-    if (server == null || !TimingSafeEquals(server.ApiToken, token))
+    if (server == null || (deployment.IsVps && server.Id != deployment.ApprovedHostId) ||
+        !TimingSafeEquals(server.ApiToken, token))
     {
         logger.LogWarning("Match result auth failed");
         return Results.Unauthorized();

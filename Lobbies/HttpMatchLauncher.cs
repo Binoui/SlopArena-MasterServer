@@ -1,5 +1,7 @@
 // MasterServer/Lobbies/HttpMatchLauncher.cs
 using System.Net.Http.Json;
+using System.Net.Http.Headers;
+using MasterServer.Configuration;
 using System.Text.Json;
 using MasterServer.Data;
 using Microsoft.EntityFrameworkCore;
@@ -22,33 +24,40 @@ public interface IMatchLauncher
 /// to the game server over HTTP and returns its assigned UDP port plus the
 /// opaque authoritative content map.
 ///
-/// The game server runs a tiny HTTP control listener (System.Net.HttpListener on
-/// the registered base port) exposing <c>POST /match/start</c>. The master server
-/// looks up the game server's IP + port from the registration record, sends the
-/// roster (steamId + locked-in character + assigned entityId), and forwards the
-/// response's <c>content</c> JSON unchanged. This keeps the game server stateless
-/// between matches (ADR-0008), and matches the existing game→master result report.
+/// The listener exposes <c>POST /match/start</c>. Development mode uses the
+/// registered address; VPS mode uses the separately provisioned private control
+/// URL and bearer key. The roster is sent and the authoritative content map is
+/// forwarded unchanged (ADR-0008).
 /// </summary>
 public sealed class HttpMatchLauncher : IMatchLauncher
 {
     private readonly AppDbContext _db;
     private readonly HttpClient _http;
     private readonly ILogger<HttpMatchLauncher> _logger;
+    private readonly MasterDeploymentOptions _deployment;
     private readonly int _maxPlayersPerLobby;
 
     /// <param name="http">Managed <see cref="HttpClient"/> from <c>AddHttpClient</c>; reused across scopes to avoid socket exhaustion.</param>
     /// <param name="options">Lobby capacity options (issue #6); defaults to 4 per lobby.</param>
-    public HttpMatchLauncher(AppDbContext db, ILogger<HttpMatchLauncher> logger, HttpClient http, LobbyOptions? options = null)
+    public HttpMatchLauncher(
+        AppDbContext db,
+        ILogger<HttpMatchLauncher> logger,
+        HttpClient http,
+        MasterDeploymentOptions deployment,
+        LobbyOptions? options = null)
     {
         _db = db;
         _logger = logger;
         _http = http;
+        _deployment = deployment;
         _maxPlayersPerLobby = LobbyOptions.ResolveMax(options);
         _http.Timeout = TimeSpan.FromSeconds(5);
     }
 
     public async Task<MatchLaunchResult> LaunchAsync(MatchStartedConfig config)
     {
+        if (_deployment.IsVps && config.ServerId != _deployment.ApprovedHostId)
+            throw new InvalidOperationException("Only the provisioned GameServer can launch VPS matches.");
         var server = await _db.GameServers.FindAsync(config.ServerId);
         if (server is null)
             throw new InvalidOperationException(
@@ -99,14 +108,23 @@ public sealed class HttpMatchLauncher : IMatchLauncher
                 .ToArray(),
         };
 
-        var url = $"http://{server.IpAddress}:{server.Port}/match/start";
+        var url = _deployment.IsVps
+            ? _deployment.ControlUrl!
+            : new Uri($"http://{server.IpAddress}:{server.Port}/match/start");
         _logger.LogInformation(
-            "Launching match {MatchId} on server {ServerId} ({Url}) with {Count} players",
-            matchId, config.ServerId, url, config.Players.Count);
+            "Launching match {MatchId} on server {ServerId} with {Count} players",
+            matchId, config.ServerId, config.Players.Count);
 
         try
         {
-            using var response = await _http.PostAsJsonAsync(url, body);
+            using var request = new HttpRequestMessage(HttpMethod.Post, url)
+            {
+                Content = JsonContent.Create(body)
+            };
+            if (_deployment.IsVps)
+                request.Headers.Authorization =
+                    new AuthenticationHeaderValue("Bearer", _deployment.MatchControlKey!);
+            using var response = await _http.SendAsync(request);
             response.EnsureSuccessStatusCode();
 
             var result = await response.Content.ReadFromJsonAsync<MatchStartResponse>();

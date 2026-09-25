@@ -13,7 +13,7 @@ queue, no pairing, and no skill/MMR matching (`User.Mmr` is stored but never use
 | --- | --- |
 | `POST /auth/guest`, `GET /auth/me` | Guest JWT creation and player info |
 | `PUT /auth/name`, `POST /auth/refresh` | Chosen name and same-identity token renewal |
-| `POST /servers/register` | Game server registration (IP, port, region, capacity) |
+| `POST /servers/register` | Explicit-development IP:port registration or authenticated, provisioned VPS host registration |
 | `POST /servers/{id}/heartbeat` | Game server liveness + load report |
 | `GET /servers` | Server browser: heartbeat-fresh, non-full game servers |
 | `POST /match/result` | Match result reporting (roster, winner) |
@@ -44,23 +44,81 @@ Requires PostgreSQL and the ASP.NET Core 8 runtime. Development settings come fr
 `appsettings.Development.json`; production settings use environment variables.
 Copying `.env.example` does not load its values into ASP.NET automatically.
 
-## Secrets (Production)
+## Deployment profiles and credentials
 
-All secrets are stored in **GitHub Secrets** and injected at deploy time.  
-Local dev uses `appsettings.Development.json` (committed with dev-only values).
+`Deployment:Profile` is required; there is no implicit production fallback.
+Local development explicitly selects `development` in
+`appsettings.Development.json`. Production VPS instances must select `vps`.
 
-| Secret | Env Variable | Purpose |
-|--------|-------------|---------|
-| JWT key | `Jwt__Secret` | Signs auth tokens |
-| DB connection | `ConnectionStrings__DefaultConnection` | PostgreSQL |
-| Steam API | `Steam__ApiKey` | Steam auth (future) |
+| Setting | Purpose |
+| --- | --- |
+| `Deployment__Profile` | `development` or `vps`; required |
+| `Jwt__Secret` | Guest JWT signing key; separate from both host credentials |
+| `ConnectionStrings__DefaultConnection` | PostgreSQL |
+| `ApprovedHost__Id` | Provisioned, non-empty host GUID; becomes the stable browser `serverId` |
+| `ApprovedHost__RegistrationKey` | Bearer credential accepted only by VPS registration |
+| `ApprovedHost__PublicHost` | Trusted public DNS name or IP advertised to clients |
+| `ApprovedHost__PublicPort` | Trusted public UDP base port |
+| `ApprovedHost__ControlUrl` | Private HTTP control endpoint, on the base port, with path `/match/start` |
+| `MatchControl__Key` | Separate bearer key Master sends to the private GameServer control listener |
+| `Steam__ApiKey` | Steam auth (future) |
 
-To use in production:
-```bash
-export Jwt__Secret="$(openssl rand -base64 64)"
-export ConnectionStrings__DefaultConnection="Host=your-host;Database=sloparena;..."
-dotnet run
+Example VPS configuration (replace placeholders in the secret/configuration
+manager; do not put real credentials in source control):
+
+```text
+Deployment__Profile=vps
+ApprovedHost__Id=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
+ApprovedHost__RegistrationKey=<managed-registration-secret>
+ApprovedHost__PublicHost=gameserver.example.net
+ApprovedHost__PublicPort=9876
+ApprovedHost__ControlUrl=http://gameserver.internal:9876/match/start
+MatchControl__Key=<different-managed-match-control-secret>
+Jwt__Secret=<different-managed-jwt-secret>
+ConnectionStrings__DefaultConnection=<postgres-connection-string>
 ```
+
+VPS startup fails closed when a required value is missing or malformed, if
+the registration/control keys are not 32–4096 character bearer tokens, if
+the JWT secret is shorter than 32 characters, if the secrets are reused,
+or if the control URL is not a private absolute HTTP endpoint with the
+configured base port and exact `/match/start` path. Use an RFC1918/ULA IP
+or a private DNS name (a single-label name or one ending in `.internal`,
+`.local`, `.localhost`, `.lan`, or `.svc`) whose host differs from
+`ApprovedHost:PublicHost`; the request body can never select this route.
+The advertised gameplay host currently supports IPv4 or DNS, not an IPv6
+literal.
+
+In VPS mode, `/servers/register` requires
+`Authorization: Bearer <ApprovedHost:RegistrationKey>` and a `hostId` equal to
+`ApprovedHost:Id`. Master ignores request `ipAddress`, `port`, and `isOfficial`;
+it advertises the configured public address and marks the approved host official.
+Name, region, capacity, and custom rules remain registration metadata. Duplicate
+registration preserves the provisioned `serverId`, persisted heartbeat/result
+`apiToken`, and current match load. The VPS server browser lists only the
+provisioned host. Imported legacy host rows cannot be joined or launched
+through the VPS profile; their old tokens cannot heartbeat, report results
+or deregister.
+
+`development` remains the explicit local mode: it retains unauthenticated
+IP:port upsert behavior and does not require `hostId`.
+
+The registration key, persisted API token, and match-control key have separate
+roles. The GameServer uses the registration key only for registration; it uses
+the API token returned by Master for heartbeat and match-result requests. Master
+uses the match-control key only for authenticated `POST /match/start`. Do not
+log credentials or place them in URLs.
+
+Generate each secret independently, for example with
+`openssl rand -base64 48`, and store it only in the secret manager.
+
+Rotate the registration key by provisioning a new value on Master and the
+GameServer together, then restarting the host; this does not rotate the stored
+API token. Rotate the match-control key by updating Master and the GameServer
+control listener together. To rotate a persisted API token, deregister the host
+with its current API token (`DELETE /servers/{id}`), then restart it so its
+approved identity registers again and receives a new token; the browser entry is
+absent during that short rotation window.
 
 ## Container release and migrations
 
@@ -74,11 +132,13 @@ runner built from the same source revision. The images use SDK
 reports immutable image digests, source revision, exact runtime, and release
 identity. Deploy by digest rather than a tag.
 
-Supply `Jwt__Secret` and `ConnectionStrings__DefaultConnection` through the
-deployment platform's secret/configuration mechanism; neither local settings
-nor secrets are included in the images. The application listens on port 8080
-and does not apply migrations during startup. Run migrations separately before
-deploying the application, passing the connection as an environment secret:
+Supply `Deployment__Profile=vps`, every `ApprovedHost__*` value,
+`MatchControl__Key`, `Jwt__Secret`, and
+`ConnectionStrings__DefaultConnection` through the deployment platform's
+configuration/secret manager. Neither local settings nor secrets are included
+in the images. The application listens on port 8080 and does not apply
+migrations during startup. Run migrations separately before deploying the
+application, passing the connection as an environment secret:
 
 ```bash
 docker run --rm --platform linux/amd64 --read-only \
@@ -89,9 +149,9 @@ docker run --rm --platform linux/amd64 --read-only \
 
 The self-contained EF bundle extracts to `/tmp/bundle`; the bounded tmpfs is
 the only writable path. The migration runner reads the connection variable
-without putting it in its command line. Then run the application image by
-its reported digest, supplying `Jwt__Secret` and
-`ConnectionStrings__DefaultConnection` externally and publishing port 8080.
+without putting it in its command line. Then run the application image by its
+reported digest, supplying the complete VPS configuration externally and
+publishing port 8080.
 
 ## Architecture
 
@@ -259,9 +319,13 @@ Run the actual test project, not the web project:
 dotnet test MasterServer.Tests/MasterServer.Tests.csproj --nologo
 ```
 
-The chat and lobby integration tests use official SignalR clients over long
-polling through the real ASP.NET pipeline. They use isolated EF InMemory stores.
-The match-launch test replaces only the external GameServer launch boundary.
+SignalR integration tests exercise the live ASP.NET pipeline over TestServer and
+use isolated EF InMemory stores. Registration tests cover development and VPS
+HTTP behavior, stable token/load refreshes, and concurrent duplicate refreshes;
+the in-memory provider does **not** prove PostgreSQL uniqueness or concurrent
+insert arbitration. Verify that race against PostgreSQL before claiming
+relational behavior. Launcher tests replace the external GameServer HTTP
+boundary and assert private VPS routing plus bearer authentication.
 
 If the SDK is installed without the ASP.NET runtime, an isolated self-contained
 test build can restore the existing framework runtime packs instead:

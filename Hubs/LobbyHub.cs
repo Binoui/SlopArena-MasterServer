@@ -2,6 +2,7 @@
 using System.Globalization;
 using System.Security.Claims;
 using MasterServer.Chat;
+using MasterServer.Configuration;
 using MasterServer.Data;
 using MasterServer.Lobbies;
 using Microsoft.AspNetCore.Authorization;
@@ -23,15 +24,17 @@ public sealed class LobbyHub : Hub
     private readonly IMatchLauncher _launcher;
     private readonly ILogger<LobbyHub> _logger;
     private readonly ChatService _chat;
+    private readonly MasterDeploymentOptions _deployment;
 
     public LobbyHub(LobbyManager lobbies, AppDbContext db, IMatchLauncher launcher,
-        ILogger<LobbyHub> logger, ChatService chat)
+        ILogger<LobbyHub> logger, ChatService chat, MasterDeploymentOptions deployment)
     {
         _lobbies = lobbies;
         _db = db;
         _launcher = launcher;
         _logger = logger;
         _chat = chat;
+        _deployment = deployment;
     }
 
     public override async Task OnConnectedAsync()
@@ -294,6 +297,8 @@ public sealed class LobbyHub : Hub
 
     private async Task<bool> IsFreshServerAsync(Guid serverId)
     {
+        if (_deployment.IsVps && serverId != _deployment.ApprovedHostId)
+            return false;
         var cutoff = DateTime.UtcNow.AddSeconds(-15);
         return await _db.GameServers.AnyAsync(
             server => server.Id == serverId && server.LastHeartbeat >= cutoff,

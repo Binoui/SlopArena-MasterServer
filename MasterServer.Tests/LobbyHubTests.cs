@@ -94,7 +94,8 @@ public class LobbyHubTests
                 _db,
                 Launcher.Object,
                 Mock.Of<ILogger<LobbyHub>>(),
-                Chat)
+                Chat,
+                MasterServer.Configuration.MasterDeploymentOptions.Development)
             {
                 Context = ctx.Object,
                 Clients = Clients.Object,

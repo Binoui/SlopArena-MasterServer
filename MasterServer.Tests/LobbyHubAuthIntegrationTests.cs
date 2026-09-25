@@ -2,6 +2,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.Configuration;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using MasterServer.Data;
@@ -24,6 +25,11 @@ public class LobbyHubAuthIntegrationTests : IClassFixture<WebApplicationFactory<
     {
         _factory = factory.WithWebHostBuilder(builder =>
         {
+            builder.ConfigureAppConfiguration((_, config) =>
+                config.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Deployment:Profile"] = "development"
+                }));
             builder.ConfigureServices(services =>
             {
                 // Replace the real Postgres DbContext with an in-memory store so the
