@@ -59,8 +59,8 @@ Local development explicitly selects `development` in
 | `ApprovedHost__RegistrationKey` | Bearer credential accepted only by VPS registration |
 | `ApprovedHost__PublicHost` | Trusted public DNS name or IP advertised to clients |
 | `ApprovedHost__PublicPort` | Trusted public UDP base port |
+| `Proxy__TrustedAddress` | Exact private IPv4 address of the reverse proxy trusted to set forwarded headers; required in VPS mode |
 | `ApprovedHost__ControlUrl` | Private HTTP control endpoint, on the base port, with path `/match/start` |
-| `MatchControl__Key` | Separate bearer key Master sends to the private GameServer control listener |
 | `Steam__ApiKey` | Steam auth (future) |
 
 Example VPS configuration (replace placeholders in the secret/configuration
@@ -73,10 +73,10 @@ ApprovedHost__RegistrationKey=<managed-registration-secret>
 ApprovedHost__PublicHost=gameserver.example.net
 ApprovedHost__PublicPort=9876
 ApprovedHost__ControlUrl=http://gameserver.internal:9876/match/start
+Proxy__TrustedAddress=172.30.11.10
 MatchControl__Key=<different-managed-match-control-secret>
 Jwt__Secret=<different-managed-jwt-secret>
 ConnectionStrings__DefaultConnection=<postgres-connection-string>
-```
 
 VPS startup fails closed when a required value is missing or malformed, if
 the registration/control keys are not 32–4096 character bearer tokens, if
@@ -99,6 +99,19 @@ registration preserves the provisioned `serverId`, persisted heartbeat/result
 provisioned host. Imported legacy host rows cannot be joined or launched
 through the VPS profile; their old tokens cannot heartbeat, report results
 or deregister.
+
+`Proxy:TrustedAddress` must be one static IPv4 address (for example, the local
+Compose Caddy proxy at `172.30.11.10`); wildcard addresses and IPv6 are rejected.
+Only that source may supply one `X-Forwarded-For` and `X-Forwarded-Proto` hop.
+Forwarded headers are ignored in explicit development mode. Forwarded client IP
+is applied before the per-IP HTTP rate limiter; do not expose the application
+port around the trusted proxy.
+
+`GET /health` is dependency-free process liveness. `GET /ready` checks database
+connectivity and pending EF migrations, returns 503 on failure or schema drift,
+and is bounded to three seconds. It never applies migrations. Graceful host
+shutdown is bounded to 15 seconds.
+
 
 `development` remains the explicit local mode: it retains unauthenticated
 IP:port upsert behavior and does not require `hostId`.
@@ -132,8 +145,8 @@ runner built from the same source revision. The images use SDK
 reports immutable image digests, source revision, exact runtime, and release
 identity. Deploy by digest rather than a tag.
 
-Supply `Deployment__Profile=vps`, every `ApprovedHost__*` value,
-`MatchControl__Key`, `Jwt__Secret`, and
+Supply `Deployment__Profile=vps`, `Proxy__TrustedAddress` set to the exact Caddy
+IPv4, every `ApprovedHost__*` value, `MatchControl__Key`, `Jwt__Secret`, and
 `ConnectionStrings__DefaultConnection` through the deployment platform's
 configuration/secret manager. Neither local settings nor secrets are included
 in the images. The application listens on port 8080 and does not apply

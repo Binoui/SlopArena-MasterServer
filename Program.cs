@@ -16,9 +16,28 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Hosting;
+using Microsoft.AspNetCore.HttpOverrides;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton(sp => MasterDeploymentOptions.Load(sp.GetRequiredService<IConfiguration>()));
+builder.Services.Configure<HostOptions>(options =>
+    options.ShutdownTimeout = TimeSpan.FromSeconds(15));
+builder.Services.AddOptions<ForwardedHeadersOptions>().Configure<MasterDeploymentOptions>((options, deployment) =>
+{
+    options.ForwardLimit = 1;
+    options.KnownProxies.Clear();
+    options.KnownNetworks.Clear();
+    if (deployment.TrustedProxyAddress is { } proxyAddress)
+    {
+        options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+        options.KnownProxies.Add(proxyAddress);
+    }
+    else
+    {
+        options.ForwardedHeaders = ForwardedHeaders.None;
+    }
+});
 
 // Service registration expands during subsequent tasks
 builder.Services.AddDbContext<AppDbContext>(options =>
@@ -133,8 +152,27 @@ var app = builder.Build();
 // Validate the selected deployment profile before any listener accepts requests.
 _ = app.Services.GetRequiredService<MasterDeploymentOptions>();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
+app.UseForwardedHeaders();
+
 
 app.MapGet("/health", () => new { status = "ok", version = "0.1.0" });
+app.MapGet("/ready", async (AppDbContext db, CancellationToken requestAborted) =>
+{
+    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(requestAborted);
+    timeout.CancelAfter(TimeSpan.FromSeconds(3));
+    try
+    {
+        if (!await db.Database.CanConnectAsync(timeout.Token))
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        if ((await db.Database.GetPendingMigrationsAsync(timeout.Token)).Any())
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        return Results.Ok(new { status = "ready" });
+    }
+    catch (Exception)
+    {
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
+});
 
 // Includes guest creation and hub negotiation. Native limiter partitions expire
 // when idle; chat/control quotas live with the authenticated guest instead.

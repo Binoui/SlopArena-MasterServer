@@ -2,6 +2,8 @@
 !MasterServer.csproj
 !nuget.config
 !Program.cs
+!Configuration/
+!Configuration/**
 !Data/
 !Data/**
 !Lobbies/

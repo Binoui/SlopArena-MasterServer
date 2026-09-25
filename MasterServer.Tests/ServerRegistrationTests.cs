@@ -52,6 +52,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
     private static Dictionary<string, string?> VpsConfiguration() => new()
     {
         ["Deployment:Profile"] = "vps",
+        ["Proxy:TrustedAddress"] = "127.0.0.1",
         ["ApprovedHost:Id"] = ApprovedHostId.ToString(),
         ["ApprovedHost:RegistrationKey"] = RegistrationKey,
         ["ApprovedHost:PublicHost"] = "game.example.com",

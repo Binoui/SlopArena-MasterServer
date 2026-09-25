@@ -12,9 +12,12 @@ public sealed record MasterDeploymentOptions(
     string? PublicHost = null,
     int? PublicPort = null,
     Uri? ControlUrl = null,
-    string? MatchControlKey = null)
+    string? MatchControlKey = null,
+    string? TrustedAddress = null)
 {
     public bool IsVps => Profile == "vps";
+    public IPAddress? TrustedProxyAddress =>
+        TrustedAddress is not null ? IPAddress.Parse(TrustedAddress) : null;
 
     public static MasterDeploymentOptions Development { get; } = new("development");
 
@@ -29,6 +32,12 @@ public sealed record MasterDeploymentOptions(
         if (string.IsNullOrWhiteSpace(configuration.GetConnectionString("DefaultConnection")))
             throw new InvalidOperationException("ConnectionStrings:DefaultConnection is required in VPS mode.");
 
+        var trustedAddressText = Required(configuration, "Proxy:TrustedAddress");
+        if (!IPAddress.TryParse(trustedAddressText, out var trustedAddress)
+            || trustedAddress.AddressFamily != AddressFamily.InterNetwork
+            || trustedAddress.Equals(IPAddress.Any))
+            throw new InvalidOperationException(
+                "Proxy:TrustedAddress must be a specific IPv4 address in VPS mode.");
         if (!Guid.TryParse(configuration["ApprovedHost:Id"], out var hostId) || hostId == Guid.Empty)
             throw new InvalidOperationException("ApprovedHost:Id must be a non-empty GUID in VPS mode.");
 
@@ -68,7 +77,7 @@ public sealed record MasterDeploymentOptions(
                 "ApprovedHost:RegistrationKey, MatchControl:Key, and Jwt:Secret must be distinct secrets.");
 
         return new MasterDeploymentOptions(
-            profile, hostId, registrationKey, publicHost, publicPort, controlUrl, matchControlKey);
+            profile, hostId, registrationKey, publicHost, publicPort, controlUrl, matchControlKey, trustedAddressText);
     }
 
     private static string Required(IConfiguration configuration, string key)
