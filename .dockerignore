@@ -16,5 +16,7 @@
 !Migrations/**
 !DTOs/
 !DTOs/**
+!Steam/
+!Steam/**
 **/bin/
 **/obj/
