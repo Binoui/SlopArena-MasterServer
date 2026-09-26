@@ -33,6 +33,10 @@ namespace MasterServer.Migrations
                         .HasMaxLength(128)
                         .HasColumnType("character varying(128)");
 
+                    b.Property<string>("CatalogHash")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
                     b.Property<int>("CurrentMatches")
                         .HasColumnType("integer");
 
@@ -43,6 +47,9 @@ namespace MasterServer.Migrations
                         .IsRequired()
                         .HasMaxLength(45)
                         .HasColumnType("character varying(45)");
+
+                    b.Property<Guid?>("InstanceId")
+                        .HasColumnType("uuid");
 
                     b.Property<bool>("IsOfficial")
                         .HasColumnType("boolean");
@@ -61,10 +68,17 @@ namespace MasterServer.Migrations
                     b.Property<int>("Port")
                         .HasColumnType("integer");
 
+                    b.Property<int>("ProtocolVersion")
+                        .HasColumnType("integer");
+
                     b.Property<string>("Region")
                         .IsRequired()
                         .HasMaxLength(16)
                         .HasColumnType("character varying(16)");
+                    b.Property<string>("SteamId")
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
+
 
                     b.HasKey("Id");
 
@@ -82,6 +96,13 @@ namespace MasterServer.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("uuid");
 
+                    b.Property<DateTime?>("CanceledAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("CancelReason")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
                     b.Property<DateTime?>("EndedAt")
                         .HasColumnType("timestamp with time zone");
 
@@ -96,6 +117,9 @@ namespace MasterServer.Migrations
 
                     b.Property<long?>("Player4SteamId")
                         .HasColumnType("bigint");
+
+                    b.Property<Guid?>("ServerId")
+                        .HasColumnType("uuid");
 
                     b.Property<string>("ServerRegion")
                         .IsRequired()
@@ -113,10 +137,26 @@ namespace MasterServer.Migrations
                     b.HasIndex("Player1SteamId");
 
                     b.HasIndex("Player2SteamId");
+                    b.HasIndex("ServerId");
+
 
                     b.HasIndex("WinnerSteamId");
 
                     b.ToTable("Matches");
+                });
+
+            modelBuilder.Entity("MasterServer.Data.Models.UsedSteamAuthTicket", b =>
+                {
+                    b.Property<string>("Hash")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateTime>("ConsumedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Hash");
+
+                    b.ToTable("UsedSteamAuthTickets");
                 });
 
             modelBuilder.Entity("MasterServer.Data.Models.User", b =>
@@ -126,6 +166,11 @@ namespace MasterServer.Migrations
                         .HasColumnType("bigint");
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("SteamId"));
+                    b.Property<string>("AuthProvider")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
 
                     b.Property<DateTime>("CreatedAt")
                         .HasColumnType("timestamp with time zone");

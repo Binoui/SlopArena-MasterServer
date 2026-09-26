@@ -9,10 +9,12 @@ using MasterServer.Data;
 using MasterServer.DTOs;
 using MasterServer.Hubs;
 using MasterServer.Lobbies;
+using MasterServer.Steam;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.AspNetCore.SignalR;
@@ -48,17 +50,24 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSignalR(options => options.AddFilter<ChatControlRateFilter>());
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<ChatService>();
-// JWT authentication — guest/dev auth (issue #30)
-var jwtSecret = builder.Configuration["Jwt:Secret"];
-if (string.IsNullOrWhiteSpace(jwtSecret))
-    throw new InvalidOperationException("Jwt:Secret is not configured. Set it in appsettings, .env, or environment variable.");
-var jwtIssuer = builder.Configuration["Jwt:Issuer"] ?? "SlopArena.Master";
-var jwtAudience = builder.Configuration["Jwt:Audience"] ?? "SlopArena.Client";
-var jwtExpiryHours = builder.Configuration.GetValue<int>("Jwt:ExpiryHours", 24);
+// Guest issuance is an explicit development mode, never inferred from the VPS profile.
+builder.Services.AddSingleton(sp => SteamAuthOptions.Load(
+    sp.GetRequiredService<IConfiguration>(),
+    sp.GetRequiredService<MasterDeploymentOptions>()));
+const string SteamProvider = "steam";
+const string GuestProvider = "guest";
+// Valve's GET API places the publisher key and ticket in the URI; never log outbound URLs.
+builder.Services.AddHttpClient<SteamTicketVerifier>().RemoveAllLoggers();
+builder.Services.AddScoped<SteamTicketReplayStore>();
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
     {
+        var jwtSecret = builder.Configuration["Jwt:Secret"];
+        if (string.IsNullOrWhiteSpace(jwtSecret))
+            throw new InvalidOperationException("Jwt:Secret is not configured.");
+        var jwtIssuer = builder.Configuration["Jwt:Issuer"] ?? "SlopArena.Master";
+        var jwtAudience = builder.Configuration["Jwt:Audience"] ?? "SlopArena.Client";
         // SignalR/WebSocket connections cannot set Authorization headers from
         // browsers, so the client passes the JWT as a "access_token" query
         // string parameter. Extract and validate it here.
@@ -73,6 +82,15 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
                 {
                     context.Token = accessToken!;
                 }
+                return Task.CompletedTask;
+            },
+            OnTokenValidated = context =>
+            {
+                var provider = context.Principal?.FindFirst("provider")?.Value;
+                var auth = context.HttpContext.RequestServices.GetRequiredService<SteamAuthOptions>();
+                if ((provider != SteamProvider || !auth.UsesSteam) &&
+                    !(auth.UsesDevelopmentGuests && provider == GuestProvider))
+                    context.Fail("Authentication provider is not permitted.");
                 return Task.CompletedTask;
             }
         };
@@ -131,9 +149,9 @@ builder.Services.AddRateLimiter(options =>
         // A party signing in together must not spend the heartbeat/admission
         // budget on guest creation, name setup, or connection negotiation.
         var budget = path.StartsWithSegments("/auth/guest") ? "guest"
+            : path.StartsWithSegments("/auth/steam") ? "steam"
             : path.StartsWithSegments("/auth/name") ? "name"
             : path.StartsWithSegments("/auth/refresh") ? "refresh"
-            : path.StartsWithSegments("/lobby/negotiate") ? "negotiate"
             : "control";
         var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
         return RateLimitPartition.GetFixedWindowLimiter(
@@ -151,8 +169,24 @@ builder.Services.AddRateLimiter(options =>
 var app = builder.Build();
 // Validate the selected deployment profile before any listener accepts requests.
 _ = app.Services.GetRequiredService<MasterDeploymentOptions>();
+var authOptions = app.Services.GetRequiredService<SteamAuthOptions>();
+var allowGuest = authOptions.UsesDevelopmentGuests;
+var jwtSecret = app.Configuration["Jwt:Secret"]!;
+var jwtIssuer = app.Configuration["Jwt:Issuer"] ?? "SlopArena.Master";
+var jwtAudience = app.Configuration["Jwt:Audience"] ?? "SlopArena.Client";
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
 app.UseForwardedHeaders();
+// Reject oversized credential bodies before minimal-API JSON binding (including TestServer).
+app.Use(async (context, next) =>
+{
+    if (context.Request.ContentLength is > 16_384 &&
+        (context.Request.Path == "/auth/steam" || context.Request.Path == "/auth/refresh"))
+    {
+        context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+        return;
+    }
+    await next();
+});
 
 
 app.MapGet("/health", () => new { status = "ok", version = "0.1.0" });
@@ -232,10 +266,25 @@ static bool IsValidIpAddress(string ip)
 
 // ── Helper: validate port range ──
 static bool IsValidPort(int port) => port > 0 && port <= 65535;
+static bool TrySteamIdentity(string? value, out string identity)
+{
+    identity = string.Empty;
+    if (value is null || value.Length is < 1 or > 20 ||
+        !ulong.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var steamId) ||
+        steamId == 0 || steamId.ToString(CultureInfo.InvariantCulture) != value)
+        return false;
+    identity = value;
+    return true;
+}
+static bool IsCatalogHash(string? hash) =>
+    hash is { Length: 64 } &&
+    hash.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
 
 // ── Guest auth endpoint (issue #30) ──
 app.MapPost("/auth/guest", async (AppDbContext db) =>
 {
+    if (!allowGuest)
+        return Results.NotFound();
     // Eight base-36 digits give guests short tags without truncating identity.
     // The database primary key remains the final uniqueness constraint.
     long steamId;
@@ -257,9 +306,57 @@ app.MapPost("/auth/guest", async (AppDbContext db) =>
     await db.SaveChangesAsync();
 
     logger.LogInformation("Guest auth: created user {SteamId} ({Username})", steamId, user.Username);
-
-    return Results.Ok(GenerateGuestAuth(steamId));
+    return Results.Ok(GenerateAuth(steamId, GuestProvider));
 });
+
+// Verify the Playtest ticket and current ownership before creating any application identity.
+app.MapPost("/auth/steam", async (SteamAuthRequest request, SteamTicketVerifier verifier,
+    SteamTicketReplayStore replay, AppDbContext db, HttpContext context) =>
+{
+    if (!authOptions.UsesSteam)
+        return Results.NotFound();
+    if (!context.Request.IsHttps)
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    if (!SteamTicketVerifier.IsValidTicket(request.Ticket))
+        return Results.BadRequest(new { error = "invalid_ticket" });
+
+    try
+    {
+        var steamId = await verifier.VerifyAsync(request.Ticket!, context.RequestAborted);
+        if (steamId is null)
+            return Results.Unauthorized();
+        if (!await replay.TryConsumeAsync(request.Ticket!, context.RequestAborted))
+            return Results.Unauthorized();
+
+        var user = await db.Users.FindAsync(steamId.Value);
+        if (user is null)
+        {
+            user = new MasterServer.Data.Models.User
+            {
+                SteamId = steamId.Value,
+                AuthProvider = SteamProvider,
+                Username = $"Steam-{steamId.Value}",
+                Mmr = 1000,
+                CreatedAt = DateTime.UtcNow
+            };
+            db.Users.Add(user);
+        }
+        else if (user.AuthProvider != SteamProvider)
+            return Results.Unauthorized();
+
+        user.LastLogin = DateTime.UtcNow;
+        await db.SaveChangesAsync(context.RequestAborted);
+        return Results.Ok(GenerateAuth(steamId.Value, SteamProvider));
+    }
+    catch (SteamApiUnavailableException)
+    {
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
+    catch (SteamReplayStoreUnavailableException)
+    {
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
+}).WithMetadata(new RequestSizeLimitAttribute(16_384));
 
 // ── Authed endpoint: get current user info (issue #30) ──
 app.MapGet("/auth/me", async (HttpContext httpContext, AppDbContext db) =>
@@ -331,31 +428,67 @@ app.MapPut("/auth/name", async (
     return Results.Ok(profile);
 }).RequireAuthorization();
 
-app.MapPost("/auth/refresh", async (HttpContext context, AppDbContext db) =>
+app.MapPost("/auth/refresh", async (HttpContext context, AppDbContext db,
+    SteamTicketVerifier verifier, SteamTicketReplayStore replay) =>
 {
     if (!long.TryParse(context.User.FindFirst(ClaimTypes.NameIdentifier)?.Value,
             NumberStyles.None, CultureInfo.InvariantCulture, out var playerId))
         return Results.Unauthorized();
-    if (await db.Users.FindAsync(playerId) is null)
-        return Results.NotFound(new { error = "User not found" });
-    return Results.Ok(GenerateGuestAuth(playerId));
-}).RequireAuthorization();
+    var provider = context.User.FindFirst("provider")?.Value;
+    var user = await db.Users.FindAsync(playerId);
+    if (user is null || user.AuthProvider != provider)
+        return Results.Unauthorized();
+    if (provider == GuestProvider && allowGuest)
+        return Results.Ok(GenerateAuth(playerId, GuestProvider));
+    if (provider != SteamProvider || !authOptions.UsesSteam)
+        return Results.Unauthorized();
+    if (!context.Request.IsHttps)
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    if (!context.Request.HasJsonContentType())
+        return Results.BadRequest(new { error = "invalid_ticket" });
+    SteamAuthRequest? request;
+    try
+    {
+        request = await context.Request.ReadFromJsonAsync<SteamAuthRequest>(
+            cancellationToken: context.RequestAborted);
+    }
+    catch (System.Text.Json.JsonException)
+    {
+        return Results.BadRequest(new { error = "invalid_ticket" });
+    }
+    if (!SteamTicketVerifier.IsValidTicket(request?.Ticket))
+        return Results.BadRequest(new { error = "invalid_ticket" });
+    try
+    {
+        if (await verifier.VerifyAsync(request!.Ticket!, context.RequestAborted) != playerId ||
+            !await replay.TryConsumeAsync(request.Ticket!, context.RequestAborted))
+            return Results.Unauthorized();
+        return Results.Ok(GenerateAuth(playerId, SteamProvider));
+    }
+    catch (SteamApiUnavailableException)
+    {
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
+    catch (SteamReplayStoreUnavailableException)
+    {
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
+}).RequireAuthorization().WithMetadata(new RequestSizeLimitAttribute(16_384));
 
-// Token renewal preserves the player identity. Expired tokens cannot silently
-// create another guest; the client must renew while its credential is valid.
-GuestAuthResponse GenerateGuestAuth(long steamId)
+GuestAuthResponse GenerateAuth(long steamId, string provider)
 {
     var claims = new[]
     {
         new Claim(ClaimTypes.NameIdentifier, steamId.ToString(CultureInfo.InvariantCulture)),
         new Claim("steam_id", steamId.ToString(CultureInfo.InvariantCulture)),
+        new Claim("provider", provider),
         new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString("N"))
     };
 
     var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret));
     var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
     var expiresAt = DateTimeOffset.FromUnixTimeSeconds(
-        DateTimeOffset.UtcNow.AddHours(jwtExpiryHours).ToUnixTimeSeconds());
+        DateTimeOffset.UtcNow.AddHours(provider == SteamProvider ? 1 : 24).ToUnixTimeSeconds());
 
     var token = new JwtSecurityToken(
         issuer: jwtIssuer,
@@ -367,12 +500,55 @@ GuestAuthResponse GenerateGuestAuth(long steamId)
     return new GuestAuthResponse(new JwtSecurityTokenHandler().WriteToken(token), steamId, expiresAt);
 }
 
+// ponytail: one Master process serializes result/cancel races; use DB conditional updates if Master is replicated.
+var matchCompletionGate = new SemaphoreSlim(1, 1);
+
+async Task<int> CancelOpenMatchesAsync(AppDbContext db, IHubContext<LobbyHub> hub,
+    Guid serverId, string reason, Guid? matchId = null)
+{
+    await matchCompletionGate.WaitAsync();
+    try
+    {
+        var open = await db.Matches.Where(match => match.ServerId == serverId &&
+            match.EndedAt == null && match.CanceledAt == null &&
+            (matchId == null || match.Id == matchId)).ToListAsync();
+        if (open.Count == 0)
+            return 0;
+        foreach (var match in open)
+        {
+            match.CanceledAt = DateTime.UtcNow;
+            match.CancelReason = reason;
+            match.WinnerSteamId = null;
+        }
+        await db.SaveChangesAsync();
+        foreach (var match in open)
+        {
+            var roster = new[] { match.Player1SteamId, match.Player2SteamId }
+                .Concat(new[] { match.Player3SteamId, match.Player4SteamId }
+                    .Where(id => id.HasValue).Select(id => id!.Value))
+                .Select(id => id.ToString(CultureInfo.InvariantCulture)).ToArray();
+            try
+            {
+                await hub.Clients.Users(roster).SendAsync("MatchAborted",
+                    new { matchId = match.Id, reason });
+            }
+            catch (Exception)
+            {
+                logger.LogWarning("Could not notify match {MatchId} cancellation.", match.Id);
+            }
+        }
+        return open.Count;
+    }
+    finally { matchCompletionGate.Release(); }
+}
+
 // ── Game server registration endpoint ──
 app.MapPost("/servers/register", async (
     ServerRegistrationRequest request,
     HttpContext httpContext,
     AppDbContext db,
-    MasterDeploymentOptions deployment) =>
+    MasterDeploymentOptions deployment,
+    IHubContext<LobbyHub> hub) =>
 {
     if (deployment.IsVps)
     {
@@ -382,6 +558,11 @@ app.MapPost("/servers/register", async (
             || request.HostId != deployment.ApprovedHostId)
             return Results.Unauthorized();
     }
+    if (deployment.IsVps &&
+        (request.ProtocolVersion != 2 || !TrySteamIdentity(request.SteamId, out _) ||
+         request.InstanceId is null || request.InstanceId == Guid.Empty ||
+         !IsCatalogHash(request.CatalogHash)))
+        return Results.BadRequest(new { error = "Current Steam identity, process instance, catalog hash and protocol 2 are required." });
 
     if (string.IsNullOrWhiteSpace(request.Name))
         return Results.BadRequest(new { error = "Name is required" });
@@ -417,6 +598,17 @@ app.MapPost("/servers/register", async (
         target.IsOfficial = isOfficial;
         target.MaxConcurrentMatches = request.MaxConcurrentMatches;
         target.CustomRulesJson = request.CustomRulesJson;
+        if (deployment.IsVps && (target.SteamId != request.SteamId ||
+            target.InstanceId != request.InstanceId))
+        {
+            await CancelOpenMatchesAsync(db, hub, target.Id, "host_restart");
+            target.ApiToken = GenerateServerApiToken();
+            target.CurrentMatches = 0;
+        }
+        target.SteamId = deployment.IsVps ? request.SteamId : null;
+        target.ProtocolVersion = deployment.IsVps ? request.ProtocolVersion : 0;
+        target.InstanceId = deployment.IsVps ? request.InstanceId : null;
+        target.CatalogHash = deployment.IsVps ? request.CatalogHash : null;
         if (!deployment.IsVps)
         {
             target.CurrentMatches = 0;
@@ -447,6 +639,10 @@ app.MapPost("/servers/register", async (
         Name = request.Name,
         IpAddress = ipAddress,
         Port = port,
+        SteamId = deployment.IsVps ? request.SteamId : null,
+        ProtocolVersion = deployment.IsVps ? request.ProtocolVersion : 0,
+        InstanceId = deployment.IsVps ? request.InstanceId : null,
+        CatalogHash = deployment.IsVps ? request.CatalogHash : null,
         Region = request.Region,
         IsOfficial = isOfficial,
         MaxConcurrentMatches = request.MaxConcurrentMatches,
@@ -507,6 +703,16 @@ app.MapPost("/servers/{serverId}/heartbeat", async (
         logger.LogWarning("Heartbeat auth failed for server {ServerId}", serverId);
         return Results.Unauthorized();
     }
+    if (deployment.IsVps && (server.SteamId != request.SteamId ||
+        server.InstanceId != request.InstanceId || server.ProtocolVersion != 2 ||
+        server.CatalogHash != request.CatalogHash))
+    {
+        // Stop advertising the superseded identity immediately; an authenticated
+        // re-registration must pin the new identity/catalog before another launch.
+        server.LastHeartbeat = DateTime.UtcNow.AddMinutes(-1);
+        await db.SaveChangesAsync();
+        return Results.Conflict(new { error = "host_identity_changed" });
+    }
 
     server.CurrentMatches = request.CurrentMatches;
     server.LastHeartbeat = DateTime.UtcNow;
@@ -523,7 +729,8 @@ app.MapDelete("/servers/{serverId}", async (
     Guid serverId,
     HttpContext httpContext,
     AppDbContext db,
-    MasterDeploymentOptions deployment) =>
+    MasterDeploymentOptions deployment,
+    IHubContext<LobbyHub> hub) =>
 {
     var token = ExtractBearerToken(httpContext, logger);
     if (token == null)
@@ -543,6 +750,8 @@ app.MapDelete("/servers/{serverId}", async (
         return Results.Unauthorized();
     }
 
+    if (deployment.IsVps)
+        await CancelOpenMatchesAsync(db, hub, server.Id, "host_shutdown");
     db.GameServers.Remove(server);
     await db.SaveChangesAsync();
 
@@ -559,7 +768,8 @@ app.MapGet("/servers", async (AppDbContext db, MasterDeploymentOptions deploymen
     if (deployment.IsVps)
     {
         var approvedId = deployment.ApprovedHostId!.Value;
-        eligible = eligible.Where(s => s.Id == approvedId);
+        eligible = eligible.Where(s => s.Id == approvedId &&
+            s.SteamId != null && s.InstanceId != null && s.ProtocolVersion == 2);
     }
     var servers = await eligible
         .OrderByDescending(s => s.IsOfficial)
@@ -571,6 +781,8 @@ app.MapGet("/servers", async (AppDbContext db, MasterDeploymentOptions deploymen
             ipAddress = s.IpAddress,
             port = s.Port,
             region = s.Region,
+            serverSteamId = s.SteamId,
+            protocolVersion = s.ProtocolVersion,
             currentMatches = s.CurrentMatches,
             maxConcurrentMatches = s.MaxConcurrentMatches,
             isOfficial = s.IsOfficial
@@ -600,36 +812,66 @@ app.MapPost("/match/result", async (
         return Results.Unauthorized();
     }
 
-    // Wrap in transaction for atomic MMR update
-    await using var transaction = await db.Database.BeginTransactionAsync();
-
+    await matchCompletionGate.WaitAsync(httpContext.RequestAborted);
     try
     {
         var match = await db.Matches.FindAsync(request.MatchId);
-        if (match == null)
-        {
-            logger.LogWarning("Match result for unknown match: {MatchId}", request.MatchId);
-            await transaction.RollbackAsync();
+        if (match is null)
             return Results.NotFound(new { error = "Match not found" });
-        }
+        if (deployment.IsVps && match.ServerId != server.Id)
+            return Results.Unauthorized();
+        if (match.CanceledAt is not null)
+            return Results.Conflict(new { error = "match_canceled" });
+        if (match.EndedAt is not null)
+            return Results.Ok(new { status = "recorded", mmrChange = 0 });
+        if (request.WinnerSteamId != 0 &&
+            request.WinnerSteamId != match.Player1SteamId &&
+            request.WinnerSteamId != match.Player2SteamId &&
+            request.WinnerSteamId != match.Player3SteamId &&
+            request.WinnerSteamId != match.Player4SteamId)
+            return Results.BadRequest(new { error = "winner_not_rostered" });
 
         match.WinnerSteamId = request.WinnerSteamId > 0 ? request.WinnerSteamId : null;
         match.EndedAt = DateTime.UtcNow;
-
-        // MMR update disabled (issue #40) — the Match row + winner are still recorded.
-
         server.CurrentMatches = Math.Max(0, server.CurrentMatches - 1);
-
-        await db.SaveChangesAsync();
-        await transaction.CommitAsync();
-
+        await db.SaveChangesAsync(httpContext.RequestAborted);
         return Results.Ok(new { status = "recorded", mmrChange = 0 });
     }
-    catch
+    finally { matchCompletionGate.Release(); }
+});
+
+app.MapPost("/match/cancel", async (MatchCancelRequest request, HttpContext context,
+    AppDbContext db, IHubContext<LobbyHub> hub, MasterDeploymentOptions deployment) =>
+{
+    var token = ExtractBearerToken(context, logger);
+    if (token is null) return Results.Unauthorized();
+    var server = await db.GameServers.FirstOrDefaultAsync(s => s.ApiToken == token);
+    if (server is null || (deployment.IsVps && server.Id != deployment.ApprovedHostId) ||
+        !TimingSafeEquals(server.ApiToken, token))
+        return Results.Unauthorized();
+    if (request.MatchId == Guid.Empty || request.Reason is not
+        ("unfilled" or "absent" or "host_restart" or "host_shutdown" or "content_unavailable"))
+        return Results.BadRequest(new { error = "invalid_cancellation" });
+    var match = await db.Matches.FindAsync(request.MatchId);
+    if (match is null)
+        return Results.NotFound();
+    if (match.ServerId != server.Id)
+        return Results.Unauthorized();
+    if (match.EndedAt is not null)
+        return Results.Conflict(new { error = "match_completed" });
+    var count = await CancelOpenMatchesAsync(db, hub, server.Id, request.Reason, request.MatchId);
+    if (count > 0)
     {
-        await transaction.RollbackAsync();
-        throw;
+        server.CurrentMatches = Math.Max(0, server.CurrentMatches - 1);
+        await db.SaveChangesAsync();
     }
+    else
+    {
+        await db.Entry(match).ReloadAsync();
+        if (match.EndedAt is not null)
+            return Results.Conflict(new { error = "match_completed" });
+    }
+    return Results.Ok(new { status = "canceled" });
 });
 
 // ── SignalR lobby hub (issue #32) ──

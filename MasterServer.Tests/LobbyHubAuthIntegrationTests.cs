@@ -28,7 +28,8 @@ public class LobbyHubAuthIntegrationTests : IClassFixture<WebApplicationFactory<
             builder.ConfigureAppConfiguration((_, config) =>
                 config.AddInMemoryCollection(new Dictionary<string, string?>
                 {
-                    ["Deployment:Profile"] = "development"
+                    ["Deployment:Profile"] = "development",
+                    ["Auth:Mode"] = "development-guest"
                 }));
             builder.ConfigureServices(services =>
             {

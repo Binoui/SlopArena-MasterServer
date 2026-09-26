@@ -10,6 +10,7 @@ namespace MasterServer.Data.Models;
 public class User
 {
     public long SteamId { get; set; } // Primary key
+    public string AuthProvider { get; set; } = "guest";
     public string Username { get; set; } = string.Empty;
     public int Mmr { get; set; } = 1000;
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;

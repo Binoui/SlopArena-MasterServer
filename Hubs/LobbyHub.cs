@@ -94,10 +94,12 @@ public sealed class LobbyHub : Hub
     /// still admits authoritative Server Chat membership; the invocation then
     /// fails with <c>lobby_full</c> after the caller receives ChatServerChanged.
     /// </summary>
-    public async Task JoinLobby(Guid serverId)
+    public async Task JoinLobby(Guid serverId, int protocolVersion)
     {
         if (!TryGetSteamId(out var playerId))
             throw new HubException("Authenticated identity missing.");
+        if (_deployment.IsVps && protocolVersion != 2)
+            throw new HubException("incompatible_protocol");
 
         JoinLobbyResult result;
         ServerChatState serverChat;
@@ -150,10 +152,12 @@ public sealed class LobbyHub : Hub
     /// Revalidates and restores a remembered active-match GameServer
     /// membership after reconnect. This never enters the waiting roster.
     /// </summary>
-    public async Task ResumeServer(Guid serverId)
+    public async Task ResumeServer(Guid serverId, int protocolVersion)
     {
         if (!TryGetSteamId(out var playerId))
             throw new HubException("Authenticated identity missing.");
+        if (_deployment.IsVps && protocolVersion != 2)
+            throw new HubException("incompatible_protocol");
 
         ServerChatState serverChat;
         await _chat.MembershipGate.WaitAsync(Context.ConnectionAborted);
@@ -248,7 +252,7 @@ public sealed class LobbyHub : Hub
 
             config = result.Config!;
             var launch = await _launcher.LaunchAsync(config);
-            config = config with { MatchPort = launch.MatchPort, Content = launch.Content };
+            config = config with { MatchPort = launch.MatchPort, Content = launch.Content, Descriptor = launch.Descriptor };
 
             // Broadcast while the launched roster is still in the lobby group,
             // then remove its waiting slots while retaining server membership.
@@ -301,7 +305,9 @@ public sealed class LobbyHub : Hub
             return false;
         var cutoff = DateTime.UtcNow.AddSeconds(-15);
         return await _db.GameServers.AnyAsync(
-            server => server.Id == serverId && server.LastHeartbeat >= cutoff,
+            server => server.Id == serverId && server.LastHeartbeat >= cutoff &&
+                (!_deployment.IsVps || (server.SteamId != null &&
+                    server.InstanceId != null && server.ProtocolVersion == 2)),
             Context.ConnectionAborted);
     }
 

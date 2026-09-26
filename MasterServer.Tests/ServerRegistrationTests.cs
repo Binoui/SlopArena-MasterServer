@@ -1,3 +1,7 @@
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+using Microsoft.IdentityModel.Tokens;
 using System.Net;
 using System.Net.Http.Json;
 using Microsoft.AspNetCore.Http.Connections;
@@ -23,6 +27,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
     private const string RegistrationKey = "registration-secret-0123456789abcdef";
     private const string MatchControlKey = "control-secret-0123456789abcdef01234567";
     private static readonly Guid ApprovedHostId = Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+    private static readonly Guid HostInstance = Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
     private readonly WebApplicationFactory<Program> _factory;
     private readonly WebApplicationFactory<Program> _vpsFactory;
 
@@ -34,6 +39,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
                 config.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["Deployment:Profile"] = "development",
+                    ["Auth:Mode"] = "development-guest",
                     ["RateLimit:MaxRequestsPerWindow"] = "100000"
                 }));
             builder.ConfigureServices(services =>
@@ -52,6 +58,10 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
     private static Dictionary<string, string?> VpsConfiguration() => new()
     {
         ["Deployment:Profile"] = "vps",
+        ["Auth:Mode"] = "steam",
+        ["Steam:ApiKey"] = "test-publisher-key",
+        ["Steam:AppId"] = "5325920",
+        ["Steam:Identity"] = "sloparena-playtest",
         ["Proxy:TrustedAddress"] = "127.0.0.1",
         ["ApprovedHost:Id"] = ApprovedHostId.ToString(),
         ["ApprovedHost:RegistrationKey"] = RegistrationKey,
@@ -62,6 +72,23 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         ["Jwt:Secret"] = "vps-test-jwt-secret-0123456789abcdefghijklmnopqrstuvwxyz",
         ["RateLimit:MaxRequestsPerWindow"] = "100000"
     };
+    private static string SteamToken(long steamId)
+    {
+        var token = new JwtSecurityToken(
+            issuer: "SlopArena.Master",
+            audience: "SlopArena.Client",
+            claims: new[]
+            {
+                new Claim(ClaimTypes.NameIdentifier, steamId.ToString()),
+                new Claim("provider", "steam")
+            },
+            expires: DateTime.UtcNow.AddMinutes(30),
+            signingCredentials: new SigningCredentials(
+                new SymmetricSecurityKey(Encoding.UTF8.GetBytes(VpsConfiguration()["Jwt:Secret"]!)),
+                SecurityAlgorithms.HmacSha256));
+        return new JwtSecurityTokenHandler().WriteToken(token);
+    }
+
 
     private static void ReplaceDatabase(IServiceCollection services, string name)
     {
@@ -92,7 +119,11 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         IsOfficial: false,
         MaxConcurrentMatches: 15,
         CustomRulesJson: null,
-        HostId: ApprovedHostId);
+        HostId: ApprovedHostId,
+        SteamId: "90293421017699331",
+        ProtocolVersion: 2,
+        InstanceId: HostInstance,
+        CatalogHash: new string('a', 64));
 
     // Each development registration uses a unique port so tests stay hermetic.
     private static int _nextPort = 9000;
@@ -133,7 +164,8 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
     {
         var request = new HttpRequestMessage(HttpMethod.Post, $"/servers/{serverId}/heartbeat")
         {
-            Content = JsonContent.Create(new { currentMatches })
+            Content = JsonContent.Create(new { currentMatches, steamId = "90293421017699331",
+                instanceId = HostInstance, catalogHash = new string('a', 64) })
         };
         if (token is not null)
             request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
@@ -332,9 +364,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         var before = await FindVpsGameServerAsync(registered.ServerId);
         Assert.NotNull(before);
 
-        using var guestResponse = await client.PostAsJsonAsync("/auth/guest", new { });
-        guestResponse.EnsureSuccessStatusCode();
-        var guest = (await guestResponse.Content.ReadFromJsonAsync<GuestAuthResponse>())!;
+        var steamToken = SteamToken(101);
         var matchId = Guid.NewGuid();
         using (var scope = _vpsFactory.Services.CreateScope())
         {
@@ -357,13 +387,13 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         using var missing = await PostVpsRegistrationAsync(client, VpsRequest("Missing key"), token: null);
         using var wrongHost = await PostVpsRegistrationAsync(
             client, VpsRequest("Wrong host") with { HostId = Guid.NewGuid() }, RegistrationKey);
-        using var jwt = await PostVpsRegistrationAsync(client, VpsRequest("JWT credential"), guest.Token);
+        using var jwt = await PostVpsRegistrationAsync(client, VpsRequest("JWT credential"), steamToken);
         using var wrongHeartbeat = await HeartbeatAsync(client, registered.ServerId, "wrong-key", currentMatches: 0);
         using var missingHeartbeat = await HeartbeatAsync(client, registered.ServerId, token: null, currentMatches: 0);
-        using var jwtHeartbeat = await HeartbeatAsync(client, registered.ServerId, guest.Token, currentMatches: 0);
+        using var jwtHeartbeat = await HeartbeatAsync(client, registered.ServerId, steamToken, currentMatches: 0);
         using var wrongResult = await PostMatchResultAsync(client, matchId, "wrong-key");
         using var missingResult = await PostMatchResultAsync(client, matchId, token: null);
-        using var jwtResult = await PostMatchResultAsync(client, matchId, guest.Token);
+        using var jwtResult = await PostMatchResultAsync(client, matchId, steamToken);
 
         Assert.All(new[]
         {
@@ -411,15 +441,15 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         Assert.Equal("game.example.com", row.IpAddress);
         Assert.Equal(28765, row.Port);
         Assert.True(row.IsOfficial);
+        Assert.Equal("90293421017699331", row.SteamId);
+        Assert.Equal(2, row.ProtocolVersion);
         Assert.Equal(3, row.CurrentMatches);
 
         using var heartbeatAfterDuplicate = await HeartbeatAsync(
             client, second.ServerId, second.ApiToken, currentMatches: 3);
         Assert.Equal(HttpStatusCode.OK, heartbeatAfterDuplicate.StatusCode);
 
-        using var guestResponse = await client.PostAsJsonAsync("/auth/guest", new { });
-        guestResponse.EnsureSuccessStatusCode();
-        var guest = (await guestResponse.Content.ReadFromJsonAsync<GuestAuthResponse>())!;
+        var steamToken = SteamToken(101);
         var importedId = Guid.NewGuid();
         using (var scope = _vpsFactory.Services.CreateScope())
         {
@@ -434,17 +464,14 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         }
         using var browserRequest = new HttpRequestMessage(HttpMethod.Get, "/servers");
         browserRequest.Headers.Authorization =
-            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", guest.Token);
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", steamToken);
         using var browserResponse = await client.SendAsync(browserRequest);
         browserResponse.EnsureSuccessStatusCode();
         using var browser = System.Text.Json.JsonDocument.Parse(
             await browserResponse.Content.ReadAsStringAsync());
         var server = Assert.Single(browser.RootElement.EnumerateArray().ToArray());
-        Assert.Equal(new[]
-        {
-            "currentMatches", "id", "ipAddress", "isOfficial",
-            "maxConcurrentMatches", "name", "port", "region"
-        }, server.EnumerateObject().Select(property => property.Name).OrderBy(name => name).ToArray());
+        Assert.Equal("90293421017699331", server.GetProperty("serverSteamId").GetString());
+        Assert.Equal(2, server.GetProperty("protocolVersion").GetInt32());
         Assert.Equal("game.example.com", server.GetProperty("ipAddress").GetString());
         Assert.Equal(28765, server.GetProperty("port").GetInt32());
         Assert.True(server.GetProperty("isOfficial").GetBoolean());
@@ -456,6 +483,236 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         Assert.Equal(HttpStatusCode.Unauthorized, oldResult.StatusCode);
         Assert.Equal(HttpStatusCode.Unauthorized, oldDeregister.StatusCode);
         Assert.NotNull(await FindVpsGameServerAsync(importedId));
+    }
+
+    [Theory]
+    [InlineData("instance")]
+    [InlineData("steam")]
+    public async Task VpsHostRotation_CancelsOldMatchAndRevokesOldHeartbeat(string changedField)
+    {
+        using var client = CreateVpsClient();
+        var first = await RegisterVpsAsync(client);
+        var matchId = Guid.NewGuid();
+        using (var scope = _vpsFactory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.Users.AddRange(
+                new User { SteamId = 101, AuthProvider = "steam", Username = "One" },
+                new User { SteamId = 202, AuthProvider = "steam", Username = "Two" });
+            db.Matches.Add(new Match
+            {
+                Id = matchId, ServerId = first.ServerId,
+                Player1SteamId = 101, Player2SteamId = 202, ServerRegion = "EU"
+            });
+            await db.SaveChangesAsync();
+        }
+        var rotated = await RegisterVpsAsync(client,
+            VpsRequest() with
+            {
+                SteamId = changedField == "steam" ? "90293421017699332" : "90293421017699331",
+                InstanceId = changedField == "instance" ? Guid.NewGuid() : HostInstance
+            });
+        Assert.Equal(first.ServerId, rotated.ServerId);
+        Assert.NotEqual(first.ApiToken, rotated.ApiToken);
+        using var staleHeartbeat = await HeartbeatAsync(client, first.ServerId, first.ApiToken);
+        Assert.Equal(HttpStatusCode.Unauthorized, staleHeartbeat.StatusCode);
+        using var wrongIdentity = await HeartbeatAsync(client, first.ServerId, rotated.ApiToken);
+        Assert.Equal(HttpStatusCode.Conflict, wrongIdentity.StatusCode);
+        using var scopeAfter = _vpsFactory.Services.CreateScope();
+        var canceled = await scopeAfter.ServiceProvider.GetRequiredService<AppDbContext>()
+            .Matches.FindAsync(matchId);
+        Assert.NotNull(canceled!.CanceledAt);
+        Assert.Equal("host_restart", canceled.CancelReason);
+        Assert.Null(canceled.EndedAt);
+        Assert.Null(canceled.WinnerSteamId);
+    }
+
+    [Fact]
+    public async Task VpsRegistration_RejectsMissingSteamIdentityBeforeAdvertisingHost()
+    {
+        using var client = CreateVpsClient();
+        using var response = await PostVpsRegistrationAsync(
+            client, VpsRequest() with { SteamId = null }, RegistrationKey);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        using var invalidHash = await PostVpsRegistrationAsync(
+            client, VpsRequest() with { CatalogHash = "not-a-catalog" }, RegistrationKey);
+        Assert.Equal(HttpStatusCode.BadRequest, invalidHash.StatusCode);
+        Assert.Equal(0, await CountVpsGameServersAsync());
+    }
+
+    [Fact]
+    public async Task VpsHeartbeat_ContentRotationStopsAdvertisingStaleIdentityUntilReregistered()
+    {
+        using var client = CreateVpsClient();
+        var first = await RegisterVpsAsync(client);
+        var activeMatch = Guid.NewGuid();
+        using (var scope = _vpsFactory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.Users.AddRange(
+                new User { SteamId = 101, AuthProvider = "steam", Username = "One" },
+                new User { SteamId = 202, AuthProvider = "steam", Username = "Two" });
+            db.Matches.Add(new Match
+            {
+                Id = activeMatch, ServerId = first.ServerId,
+                Player1SteamId = 101, Player2SteamId = 202, ServerRegion = "EU"
+            });
+            await db.SaveChangesAsync();
+        }
+        using var load = await HeartbeatAsync(client, first.ServerId, first.ApiToken, 1);
+        Assert.Equal(HttpStatusCode.OK, load.StatusCode);
+        using var changed = new HttpRequestMessage(HttpMethod.Post,
+            $"/servers/{first.ServerId}/heartbeat")
+        {
+            Content = JsonContent.Create(new
+            {
+                currentMatches = 1, steamId = VpsRequest().SteamId,
+                instanceId = HostInstance, catalogHash = new string('b', 64)
+            })
+        };
+        changed.Headers.Authorization = new("Bearer", first.ApiToken);
+        using var mismatch = await client.SendAsync(changed);
+        Assert.Equal(HttpStatusCode.Conflict, mismatch.StatusCode);
+
+        using var browser = new HttpRequestMessage(HttpMethod.Get, "/servers");
+        browser.Headers.Authorization = new("Bearer", SteamToken(101));
+        using var hidden = await client.SendAsync(browser);
+        hidden.EnsureSuccessStatusCode();
+        var list = (await hidden.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>()).EnumerateArray();
+        Assert.Empty(list);
+
+        var rotated = await RegisterVpsAsync(client,
+            VpsRequest() with { CatalogHash = new string('b', 64) });
+        Assert.Equal(first.ApiToken, rotated.ApiToken);
+        using var browserAfter = new HttpRequestMessage(HttpMethod.Get, "/servers");
+        browserAfter.Headers.Authorization = new("Bearer", SteamToken(101));
+        using var visible = await client.SendAsync(browserAfter);
+        visible.EnsureSuccessStatusCode();
+        var restored = (await visible.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>()).EnumerateArray();
+        Assert.Single(restored);
+        using var stateScope = _vpsFactory.Services.CreateScope();
+        var stateDb = stateScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        Assert.Null((await stateDb.Matches.FindAsync(activeMatch))!.CanceledAt);
+        Assert.Equal(1, (await stateDb.GameServers.FindAsync(first.ServerId))!.CurrentMatches);
+    }
+
+    [Fact]
+    public async Task MatchCancellation_DoesNotManufactureWinnerOrConsumeCapacityTwice()
+    {
+        using var client = CreateVpsClient();
+        var registered = await RegisterVpsAsync(client);
+        using var heartbeat = await HeartbeatAsync(client, registered.ServerId, registered.ApiToken, 2);
+        Assert.Equal(HttpStatusCode.OK, heartbeat.StatusCode);
+        var canceledId = Guid.NewGuid();
+        var finishedId = Guid.NewGuid();
+        using (var scope = _vpsFactory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.Users.AddRange(
+                new User { SteamId = 101, AuthProvider = "steam", Username = "One" },
+                new User { SteamId = 202, AuthProvider = "steam", Username = "Two" });
+            db.Matches.AddRange(
+                new Match { Id = canceledId, ServerId = registered.ServerId,
+                    Player1SteamId = 101, Player2SteamId = 202, ServerRegion = "EU" },
+                new Match { Id = finishedId, ServerId = registered.ServerId,
+                    Player1SteamId = 101, Player2SteamId = 202, ServerRegion = "EU" });
+            await db.SaveChangesAsync();
+        }
+
+        async Task<HttpResponseMessage> Cancel(Guid matchId)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "/match/cancel")
+            {
+                Content = JsonContent.Create(new MatchCancelRequest(matchId, "absent"))
+            };
+            request.Headers.Authorization = new("Bearer", registered.ApiToken);
+            return await client.SendAsync(request);
+        }
+        using var first = await Cancel(canceledId);
+        using var duplicate = await Cancel(canceledId);
+        using var tooLate = await PostMatchResultAsync(client, canceledId, registered.ApiToken);
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, duplicate.StatusCode);
+        Assert.Equal(HttpStatusCode.Conflict, tooLate.StatusCode);
+
+        using var result = await PostMatchResultAsync(client, finishedId, registered.ApiToken);
+        using var repeatedResult = await PostMatchResultAsync(client, finishedId, registered.ApiToken);
+        using var cancelFinished = await Cancel(finishedId);
+        Assert.Equal(HttpStatusCode.OK, result.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, repeatedResult.StatusCode);
+        Assert.Equal(HttpStatusCode.Conflict, cancelFinished.StatusCode);
+
+        using var scopeAfter = _vpsFactory.Services.CreateScope();
+        var dbAfter = scopeAfter.ServiceProvider.GetRequiredService<AppDbContext>();
+        var canceled = (await dbAfter.Matches.FindAsync(canceledId))!;
+        var finished = (await dbAfter.Matches.FindAsync(finishedId))!;
+        Assert.Equal("absent", canceled.CancelReason);
+        Assert.NotNull(canceled.CanceledAt);
+        Assert.Null(canceled.EndedAt);
+        Assert.Null(canceled.WinnerSteamId);
+        Assert.NotNull(finished.EndedAt);
+        Assert.Null(finished.CanceledAt);
+        Assert.Equal(101, finished.WinnerSteamId);
+        Assert.Equal(0, (await dbAfter.GameServers.FindAsync(registered.ServerId))!.CurrentMatches);
+    }
+
+    [Fact]
+    public async Task CancelMatch_NotifiesOnlyItsRosterAndKeepsServerChatMembership()
+    {
+        using var client = CreateVpsClient();
+        var registered = await RegisterVpsAsync(client);
+        var matchId = Guid.NewGuid();
+        using (var scope = _vpsFactory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.Users.AddRange(
+                new User { SteamId = 101, AuthProvider = "steam", Username = "One" },
+                new User { SteamId = 202, AuthProvider = "steam", Username = "Two" },
+                new User { SteamId = 303, AuthProvider = "steam", Username = "Outsider" });
+            db.Matches.Add(new Match
+            {
+                Id = matchId, ServerId = registered.ServerId, Player1SteamId = 101,
+                Player2SteamId = 202, ServerRegion = "EU"
+            });
+            await db.SaveChangesAsync();
+        }
+
+        await using var rostered = new HubConnectionBuilder()
+            .WithUrl(new Uri(_vpsFactory.Server.BaseAddress, "lobby"), options =>
+            {
+                options.Transports = HttpTransportType.LongPolling;
+                options.HttpMessageHandlerFactory = _ => _vpsFactory.Server.CreateHandler();
+                options.AccessTokenProvider = () => Task.FromResult<string?>(SteamToken(101));
+            }).Build();
+        await using var outsider = new HubConnectionBuilder()
+            .WithUrl(new Uri(_vpsFactory.Server.BaseAddress, "lobby"), options =>
+            {
+                options.Transports = HttpTransportType.LongPolling;
+                options.HttpMessageHandlerFactory = _ => _vpsFactory.Server.CreateHandler();
+                options.AccessTokenProvider = () => Task.FromResult<string?>(SteamToken(303));
+            }).Build();
+        var notice = new TaskCompletionSource<System.Text.Json.JsonElement>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var leaked = 0;
+        rostered.On<System.Text.Json.JsonElement>("MatchAborted", payload => notice.TrySetResult(payload));
+        outsider.On<System.Text.Json.JsonElement>("MatchAborted", _ => Interlocked.Increment(ref leaked));
+        await rostered.StartAsync();
+        await outsider.StartAsync();
+        await rostered.InvokeAsync("JoinLobby", registered.ServerId, 2);
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/match/cancel")
+        {
+            Content = JsonContent.Create(new MatchCancelRequest(matchId, "unfilled"))
+        };
+        request.Headers.Authorization = new("Bearer", registered.ApiToken);
+        using var response = await client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var received = await notice.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(matchId, received.GetProperty("matchId").GetGuid());
+        Assert.Equal("unfilled", received.GetProperty("reason").GetString());
+        Assert.Equal(0, leaked);
+        var chat = await rostered.InvokeAsync<MasterServer.Chat.ChatSnapshot>("GetChatState");
+        Assert.Equal(registered.ServerId, chat.Server.ServerId);
     }
 
     [Fact]
@@ -472,23 +729,55 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
                 Port = 28766, Region = "EU", IsOfficial = true, MaxConcurrentMatches = 5,
                 ApiToken = "old-token", LastHeartbeat = DateTime.UtcNow
             });
+            db.Users.Add(new User
+            {
+                SteamId = 101, AuthProvider = "steam", Username = "Test Steam User",
+                Mmr = 1000, CreatedAt = DateTime.UtcNow, LastLogin = DateTime.UtcNow
+            });
             await db.SaveChangesAsync();
         }
-        using var auth = await client.PostAsJsonAsync("/auth/guest", new { });
-        auth.EnsureSuccessStatusCode();
-        var guest = (await auth.Content.ReadFromJsonAsync<GuestAuthResponse>())!;
+        var steamToken = SteamToken(101);
         await using var connection = new HubConnectionBuilder()
             .WithUrl(new Uri(_vpsFactory.Server.BaseAddress, "lobby"), options =>
             {
                 options.Transports = HttpTransportType.LongPolling;
                 options.HttpMessageHandlerFactory = _ => _vpsFactory.Server.CreateHandler();
-                options.AccessTokenProvider = () => Task.FromResult<string?>(guest.Token);
+                options.AccessTokenProvider = () => Task.FromResult<string?>(steamToken);
             }).Build();
         await connection.StartAsync();
 
         var error = await Assert.ThrowsAsync<HubException>(() =>
-            connection.InvokeAsync("JoinLobby", importedId));
+            connection.InvokeAsync("JoinLobby", importedId, 2));
         Assert.Contains("server_unavailable", error.Message);
+    }
+
+    [Fact]
+    public async Task VpsLobby_RejectsLegacyProtocolBeforeAllocatingRosterSlot()
+    {
+        using var client = CreateVpsClient();
+        var registered = await RegisterVpsAsync(client);
+        using (var scope = _vpsFactory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.Users.Add(new User { SteamId = 101, AuthProvider = "steam", Username = "Player" });
+            await db.SaveChangesAsync();
+        }
+        var token = SteamToken(101);
+        await using var connection = new HubConnectionBuilder()
+            .WithUrl(new Uri(_vpsFactory.Server.BaseAddress, "lobby"), options =>
+            {
+                options.Transports = HttpTransportType.LongPolling;
+                options.HttpMessageHandlerFactory = _ => _vpsFactory.Server.CreateHandler();
+                options.AccessTokenProvider = () => Task.FromResult<string?>(token);
+            }).Build();
+        await connection.StartAsync();
+        var legacy = await Assert.ThrowsAsync<HubException>(() =>
+            connection.InvokeAsync("JoinLobby", registered.ServerId, 0));
+        Assert.Contains("incompatible_protocol", legacy.Message);
+        await connection.InvokeAsync("JoinLobby", registered.ServerId, 2);
+        var snapshot = _vpsFactory.Services.GetRequiredService<MasterServer.Lobbies.LobbyManager>()
+            .GetSnapshot(connection.ConnectionId!);
+        Assert.Single(Assert.IsType<MasterServer.Lobbies.LobbySnapshot>(snapshot).Players);
     }
 
     [Fact]

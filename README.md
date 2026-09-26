@@ -1,6 +1,6 @@
 # SlopArena Master Server
 
-Backend API for SlopArena: guest sessions, game server registration, the server browser, SignalR lobbies, and game-wide chat.
+Backend API for Steam Playtest sessions (or explicit development guests), game server registration, the server browser, SignalR lobbies, and game-wide chat.
 Matchmaking is planned but **not yet implemented**; the server browser is the current entry point.
 
 ## Scope
@@ -11,13 +11,13 @@ queue, no pairing, and no skill/MMR matching (`User.Mmr` is stored but never use
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /auth/guest`, `GET /auth/me` | Guest JWT creation and player info |
-| `PUT /auth/name`, `POST /auth/refresh` | Chosen name and same-identity token renewal |
-| `POST /servers/register` | Explicit-development IP:port registration or authenticated, provisioned VPS host registration |
-| `POST /servers/{id}/heartbeat` | Game server liveness + load report |
-| `GET /servers` | Server browser: heartbeat-fresh, non-full game servers |
-| `POST /match/result` | Match result reporting (roster, winner) |
-| `/lobby` (SignalR) | Lobby control, Global Chat, Server Chat, Direct Messages, and online presence |
+| `POST /auth/steam`, `POST /auth/guest`, `GET /auth/me` | Verified Playtest login, development-only guest login, current player |
+| `PUT /auth/name`, `POST /auth/refresh` | Chosen name and same-identity renewal (Steam requires a fresh web ticket) |
+| `POST /servers/register` | Trusted provisioned GUID + current Steam GameHost identity, protocol and process instance (development: IP:port) |
+| `POST /servers/{id}/heartbeat` | GameHost liveness/load and current identity check |
+| `GET /servers` | Fresh, compatible server browser |
+| `POST /match/result`, `POST /match/cancel` | Private authenticated completion or cancellation; no competitive result on cancellation |
+| `/lobby` (SignalR) | Versioned lobby admission, roster-only typed Steam match descriptor, chat and cancellation notices |
 
 ## Tech Stack
 
@@ -53,21 +53,25 @@ Local development explicitly selects `development` in
 | Setting | Purpose |
 | --- | --- |
 | `Deployment__Profile` | `development` or `vps`; required |
-| `Jwt__Secret` | Guest JWT signing key; separate from both host credentials |
+| `Jwt__Secret` | Application JWT signing key; separate from both host credentials |
 | `ConnectionStrings__DefaultConnection` | PostgreSQL |
 | `ApprovedHost__Id` | Provisioned, non-empty host GUID; becomes the stable browser `serverId` |
 | `ApprovedHost__RegistrationKey` | Bearer credential accepted only by VPS registration |
-| `ApprovedHost__PublicHost` | Trusted public DNS name or IP advertised to clients |
-| `ApprovedHost__PublicPort` | Trusted public UDP base port |
+| `ApprovedHost__PublicHost` | Trusted public DNS/IP metadata; Steam gameplay uses its verified identity instead |
+| `ApprovedHost__PublicPort` | Private GameHost control base port (legacy development UDP still uses port allocation) |
 | `Proxy__TrustedAddress` | Exact private IPv4 address of the reverse proxy trusted to set forwarded headers; required in VPS mode |
-| `ApprovedHost__ControlUrl` | Private HTTP control endpoint, on the base port, with path `/match/start` |
-| `Steam__ApiKey` | Steam auth (future) |
+| `ApprovedHost__ControlUrl` | Private HTTP control endpoint on the base port, path `/match/start`; not public gameplay ingress |
+| `Auth__Mode`, `Steam__ApiKey`, `Steam__AppId`, `Steam__Identity` | `steam` required on VPS; publisher key stays on Master, explicit Playtest AppID and fixed identity `sloparena-playtest` |
 
 Example VPS configuration (replace placeholders in the secret/configuration
 manager; do not put real credentials in source control):
 
 ```text
 Deployment__Profile=vps
+Auth__Mode=steam
+Steam__ApiKey=<managed-publisher-key>
+Steam__AppId=<verified-playtest-app-id>
+Steam__Identity=sloparena-playtest
 ApprovedHost__Id=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
 ApprovedHost__RegistrationKey=<managed-registration-secret>
 ApprovedHost__PublicHost=gameserver.example.net
@@ -78,6 +82,8 @@ MatchControl__Key=<different-managed-match-control-secret>
 Jwt__Secret=<different-managed-jwt-secret>
 ConnectionStrings__DefaultConnection=<postgres-connection-string>
 
+```
+
 VPS startup fails closed when a required value is missing or malformed, if
 the registration/control keys are not 32–4096 character bearer tokens, if
 the JWT secret is shorter than 32 characters, if the secrets are reused,
@@ -86,19 +92,48 @@ configured base port and exact `/match/start` path. Use an RFC1918/ULA IP
 or a private DNS name (a single-label name or one ending in `.internal`,
 `.local`, `.localhost`, `.lan`, or `.svc`) whose host differs from
 `ApprovedHost:PublicHost`; the request body can never select this route.
+Public VPS auth is Steam-only. Startup requires `Auth__Mode=steam` plus the
+publisher key, positive Playtest AppID, and exact `Steam__Identity`. Configure
+the actual AppID against operator-owned Steamworks settings before deployment;
+the development/SteamPipe candidate is `5325920`, not a deployed guarantee.
+`appsettings.Development.json` explicitly selects `development-guest`; a
+development Steam test can instead select `Auth__Mode=steam` with the same
+required Steam settings. Guest JWTs, including ones issued before this cutover,
+fail public REST, SignalR, and refresh. No publisher key, ticket, or
+credential-bearing Valve URL belongs in logs or client assets. Apply the
+`AddSteamAuthIdentity` and `AddSteamMatchRouting` database migrations before a compatible cutover.
+
 The advertised gameplay host currently supports IPv4 or DNS, not an IPv6
 literal.
 
-In VPS mode, `/servers/register` requires
-`Authorization: Bearer <ApprovedHost:RegistrationKey>` and a `hostId` equal to
-`ApprovedHost:Id`. Master ignores request `ipAddress`, `port`, and `isOfficial`;
-it advertises the configured public address and marks the approved host official.
-Name, region, capacity, and custom rules remain registration metadata. Duplicate
-registration preserves the provisioned `serverId`, persisted heartbeat/result
-`apiToken`, and current match load. The VPS server browser lists only the
-provisioned host. Imported legacy host rows cannot be joined or launched
-through the VPS profile; their old tokens cannot heartbeat, report results
-or deregister.
+In VPS mode, `/servers/register` requires the provisioned host GUID,
+`Authorization: Bearer <ApprovedHost:RegistrationKey>`, canonical decimal-string
+GameHost `steamId`, `protocolVersion: 2`, nonempty per-process `instanceId` GUID,
+and lowercase SHA-256 `catalogHash` of the admitted immutable content map.
+Master ignores request IP/UDP address and official flag. A heartbeat with a
+changed identity or catalog hash immediately makes the old browser entry
+ineligible. A fresh registration under the same host GUID pins the change,
+cancels its open matches, rotates the API token and notifies rostered clients;
+unchanged registration preserves load/token. No Steam ID is substituted into
+an IP field. Browser entries publish the current `serverSteamId` and protocol
+only while heartbeat-fresh. Legacy imported rows cannot join, heartbeat or
+complete VPS matches.
+
+Master creates the authoritative Match row and roster before its private
+`POST /match/start`, passing the registered catalog hash as the exact expected
+content identity. GameHost rejects a changed local map before allocation and
+responds with cooked content, the matching digest and its own verified Steam
+identity. Only that roster receives a `MatchStarted.descriptor` (`steam-p2p`,
+host identity, GUID, virtual port 0, protocol 2, content digest, admission
+deadline); old clients are denied a VPS lobby slot. GameHost controls admission
+and authoritative simulation.
+It reports normal results once, or calls authenticated `POST /match/cancel`
+with `unfilled`, `absent`, `host_restart`, `host_shutdown` or
+`content_unavailable`. Cancellation records reason/time with no winner/MMR,
+signals `MatchAborted` to the roster, and retains Global/Server/Direct chat
+membership. Neither a temporary Steam web-auth outage nor Master unavailability
+ends a match already admitted at GameHost. Do not deploy these changes without
+a compatible Master/GameHost/client release and the DB migrations.
 
 `Proxy:TrustedAddress` must be one static IPv4 address (for example, the local
 Compose Caddy proxy at `172.30.11.10`); wildcard addresses and IPv6 are rejected.
@@ -170,11 +205,13 @@ publishing port 8080.
 
 ```
 SlopArena-MasterServer/
-├── Data/           # EF Core DbContext + migrations + models
+├── Data/           # EF Core DbContext + models
+├── Migrations/     # Versioned PostgreSQL schema
 ├── DTOs/           # API request/response models
 ├── Chat/           # Bounded chat state, immutable wire records, validation, quotas
 ├── Hubs/           # Authenticated LobbyHub: chat + per-server lobby flow
 ├── Lobbies/        # LobbyManager (in-memory lobby authority) + HTTP match launcher
+├── Steam/          # Playtest ticket verification and durable replay store
 ├── Program.cs      # ASP.NET entry point
 └── appsettings.json
 ```
@@ -187,25 +224,30 @@ Gameplay remains in the GameServer and Shared simulation.
 This is the Master-side contract for [SlopArena chat](https://github.com/Binoui/SlopArena/issues/206).
 Unity ownership, UI, local mute, drafts, scrollback, and input isolation are separate client work.
 
-### Guest lifecycle
+### Application session lifecycle
 
-1. Choose or load a Display Name before online use. Do not block local play.
-2. Call `POST /auth/guest` once per game launch. It returns
-   `{ token, steamId, expiresAt }`. The legacy `steamId` field is a guest ID, not
-   a verified Steam identity.
-3. With that JWT, call `PUT /auth/name` with `{ \"displayName\": \"Alex\" }`.
-   Wait for success before starting the hub. This updates the existing user's
-   name; it does not create another account.
-4. Register push handlers, connect to `/lobby`, then call `GetChatState`.
-   A completed transport handshake alone does not confirm chat admission.
-5. Before `expiresAt`, call authenticated `POST /auth/refresh`. It returns a
-   new JWT for the same identity. Supply the current token through the SignalR
-   access-token provider. An expired token returns HTTP 401; do not silently
-   create another guest.
+1. A Steam client calls `GetAuthTicketForWebApi("sloparena-playtest")`, waits
+   for its callback, and sends `{ "ticket": "<hex>" }` to HTTPS
+   `POST /auth/steam`. Master validates the ticket and current Playtest
+   ownership through Valve, durably records the consumed ticket digest,
+   and returns `{ token, steamId, expiresAt }` for the verified identity.
+   Usernames are presentation; an existing guest row is never merged.
+2. The Steam JWT expires after one hour. Before expiry, call authenticated
+   `POST /auth/refresh` with a **fresh** web ticket and the same account;
+   current ownership is checked again. Replayed, wrong-account or
+   unentitled tickets fail; an expired bearer cannot renew. A fresh ticket
+   can start a new session for the same account. During a Valve outage,
+   existing JWTs remain valid until expiry, but login and renewal fail closed.
+3. Explicit `development-guest` mode retains `POST /auth/guest` and its
+   ticketless refresh for Editor/local development only. VPS rejects guest
+   issuance and previously signed guest tokens; there is no public fallback.
+4. Both modes apply `PUT /auth/name` to the same account before connecting
+   the single `/lobby` SignalR client. Save the display name independently
+   of account identity. Names allow duplicates; HTTP and SignalR use the
+   same bearer token, and the hub query-token route remains supported.
 
-Use Bearer authentication for HTTP and SignalR. The existing hub query-token
-path remains supported. Do not log tokens or token-bearing URLs.
-`GET /auth/me` returns `{ steamId, username, mmr, sessionTag }`.
+Do not log tokens or token-bearing URLs. `GET /auth/me` returns
+`{ steamId, username, mmr, sessionTag }`.
 
 Names allow duplicates. They contain 1–24 Unicode scalar values after trimming.
 Blank or malformed names, control characters, and line separators are rejected.

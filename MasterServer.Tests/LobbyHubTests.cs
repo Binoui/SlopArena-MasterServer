@@ -113,7 +113,7 @@ public class LobbyHubTests
         var harness = new HubHarness(db);
         var hub = harness.CreateHub("c1", 101, "Alice");
 
-        await hub.JoinLobby(ServerId);
+        await hub.JoinLobby(ServerId, 0);
 
         // PlayerJoined + LobbyUpdated are both broadcast to the lobby group.
         harness.GroupProxy.Verify(
@@ -136,8 +136,8 @@ public class LobbyHubTests
         var hub1 = harness.CreateHub("c1", 101, "Alice");
         var hub2 = harness.CreateHub("c2", 202, "Bob");
 
-        await hub1.JoinLobby(ServerId);
-        await hub2.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
+        await hub2.JoinLobby(ServerId, 0);
 
         // Two joins → two PlayerJoined, two LobbyUpdated.
         harness.GroupProxy.Verify(
@@ -156,8 +156,8 @@ public class LobbyHubTests
         var hub1 = harness.CreateHub("c1", 101, "Alice");
         var hub2 = harness.CreateHub("c2", 202, "Bob");
 
-        await hub1.JoinLobby(ServerId);
-        await hub2.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
+        await hub2.JoinLobby(ServerId, 0);
         // Clear invocations from the join phase.
         harness.GroupProxy.Reset();
 
@@ -182,8 +182,8 @@ public class LobbyHubTests
         var hub1 = harness.CreateHub("c1", 101, "Alice");
         var hub2 = harness.CreateHub("c2", 202, "Bob");
 
-        await hub1.JoinLobby(ServerId);
-        await hub2.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
+        await hub2.JoinLobby(ServerId, 0);
 
         await Assert.ThrowsAsync<HubException>(() => hub2.HostStart());
 
@@ -202,8 +202,8 @@ public class LobbyHubTests
         var hub1 = harness.CreateHub("c1", 101, "Alice");
         var hub2 = harness.CreateHub("c2", 202, "Bob");
 
-        await hub1.JoinLobby(ServerId);
-        await hub2.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
+        await hub2.JoinLobby(ServerId, 0);
 
         await hub1.HostStart();
 
@@ -223,8 +223,8 @@ public class LobbyHubTests
         var hub1 = harness.CreateHub("c1", 101, "Alice");
         var hub2 = harness.CreateHub("c2", 202, "Bob");
 
-        await hub1.JoinLobby(ServerId);
-        await hub2.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
+        await hub2.JoinLobby(ServerId, 0);
         harness.GroupProxy.Reset();
 
         await hub2.OnDisconnectedAsync(null);
@@ -244,7 +244,7 @@ public class LobbyHubTests
         var harness = new HubHarness(db);
         var hub1 = harness.CreateHub("c1", 101, "Alice");
 
-        await hub1.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
 
         // Clear invocations from the join phase — we only care about disconnect broadcasts.
         harness.GroupProxy.Reset();
@@ -268,8 +268,8 @@ public class LobbyHubTests
         var hub1 = harness.CreateHub("c1", 101, "Alice");
         var hub2 = harness.CreateHub("c2", 202, "Bob");
 
-        await hub1.JoinLobby(ServerId);
-        await hub2.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
+        await hub2.JoinLobby(ServerId, 0);
         await hub1.LeaveLobby(); // host leaves → Bob promoted
 
         // Bob (now host) can start.
@@ -286,7 +286,7 @@ public class LobbyHubTests
         var harness = new HubHarness(db);
         var hub1 = harness.CreateHub("c1", 101, "Alice");
 
-        await hub1.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
         harness.GroupProxy.Reset();
 
         await hub1.SelectCharacter("Manki");
@@ -317,7 +317,7 @@ public class LobbyHubTests
         var harness = new HubHarness(db);
         var hub1 = harness.CreateHub("c1", 101, "Alice");
 
-        await hub1.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
 
         await hub1.SelectCharacter("Manki");
         await hub1.SelectCharacter("FightGuy");
@@ -336,8 +336,8 @@ public class LobbyHubTests
         var hub1 = harness.CreateHub("c1", 101, "Alice");
         var hub2 = harness.CreateHub("c2", 202, "Bob");
 
-        await hub1.JoinLobby(ServerId);
-        await hub2.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
+        await hub2.JoinLobby(ServerId, 0);
         await hub1.SelectCharacter("Manki");
         await hub2.SelectCharacter("FightGuy");
 
@@ -357,8 +357,8 @@ public class LobbyHubTests
         var hub1 = harness.CreateHub("c1", 101, "Alice");
         var hub2 = harness.CreateHub("c2", 202, "Bob");
 
-        await hub1.JoinLobby(ServerId);
-        await hub2.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
+        await hub2.JoinLobby(ServerId, 0);
 
         // Only Alice locks in; Bob hasn't.
         await hub1.SelectCharacter("Manki");
@@ -380,8 +380,8 @@ public class LobbyHubTests
         var hub1 = harness.CreateHub("c1", 101, "Alice");
         var hub2 = harness.CreateHub("c2", 202, "Bob");
 
-        await hub1.JoinLobby(ServerId);
-        await hub2.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
+        await hub2.JoinLobby(ServerId, 0);
         await hub1.SelectCharacter("Manki");
         await hub2.SelectCharacter("FightGuy");
         harness.GroupProxy.Reset();
@@ -412,8 +412,8 @@ public class LobbyHubTests
         var hub1 = harness.CreateHub("c1", 101, "Alice");
         var hub2 = harness.CreateHub("c2", 202, "Bob");
 
-        await hub1.JoinLobby(ServerId);
-        await hub2.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
+        await hub2.JoinLobby(ServerId, 0);
         await hub1.SelectCharacter("Manki");
         await hub2.SelectCharacter("FightGuy");
         harness.GroupProxy.Reset();
@@ -441,8 +441,8 @@ public class LobbyHubTests
         var hub1 = harness.CreateHub("c1", 101, "Alice");
         var hub2 = harness.CreateHub("c2", 202, "Bob");
 
-        await hub1.JoinLobby(ServerId);
-        await hub2.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
+        await hub2.JoinLobby(ServerId, 0);
         await hub1.SelectCharacter("Manki");
         await hub2.SelectCharacter("FightGuy");
         harness.GroupProxy.Reset();
@@ -472,7 +472,7 @@ public class LobbyHubTests
         var harness = new HubHarness(db);
         var hub1 = harness.CreateHub("c1", 101, "Alice");
 
-        await hub1.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
         await hub1.SelectCharacter("Manki");
 
         await Assert.ThrowsAsync<HubException>(() => hub1.StartMatch("training"));
@@ -488,8 +488,8 @@ public class LobbyHubTests
         var hub1 = harness.CreateHub("c1", 101, "Alice");
         var hub2 = harness.CreateHub("c2", 202, "Bob");
 
-        await hub1.JoinLobby(ServerId);
-        await hub2.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
+        await hub2.JoinLobby(ServerId, 0);
         await hub1.SelectCharacter("Manki");
         await hub2.SelectCharacter("FightGuy");
         harness.GroupProxy.Reset();
@@ -512,8 +512,8 @@ public class LobbyHubTests
         var hub1 = harness.CreateHub("c1", 101, "Alice");
         var hub2 = harness.CreateHub("c2", 202, "Bob");
 
-        await hub1.JoinLobby(ServerId);
-        await hub2.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
+        await hub2.JoinLobby(ServerId, 0);
         await hub1.SelectCharacter("Manki");
         await hub2.SelectCharacter("FightGuy");
 
@@ -532,8 +532,8 @@ public class LobbyHubTests
         var hub1 = harness.CreateHub("c1", 101, "Alice");
         var hub2 = harness.CreateHub("c2", 202, "Bob");
 
-        await hub1.JoinLobby(ServerId);
-        await hub2.JoinLobby(ServerId);
+        await hub1.JoinLobby(ServerId, 0);
+        await hub2.JoinLobby(ServerId, 0);
         // Only Alice locked in.
         await hub1.SelectCharacter("Manki");
 
@@ -554,11 +554,11 @@ public class LobbyHubTests
         for (int i = 0; i < 4; i++)
         {
             var h = harness.CreateHub($"c{i}", 100 + i, $"P{i}");
-            await h.JoinLobby(ServerId);
+            await h.JoinLobby(ServerId, 0);
         }
         var fifth = harness.CreateHub("c4", 505, "Eve");
 
-        await Assert.ThrowsAsync<HubException>(() => fifth.JoinLobby(ServerId));
+        await Assert.ThrowsAsync<HubException>(() => fifth.JoinLobby(ServerId, 0));
 
         // Exactly 4 PlayerJoined broadcasts — the rejected join adds none.
         harness.GroupProxy.Verify(

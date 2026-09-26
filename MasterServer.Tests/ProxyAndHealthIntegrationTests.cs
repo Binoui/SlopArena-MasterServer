@@ -16,6 +16,7 @@ public sealed class ProxyAndHealthIntegrationTests
         using var factory = CreateFactory(new Dictionary<string, string?>
         {
             ["Deployment:Profile"] = "development",
+            ["Auth:Mode"] = "development-guest",
             ["RateLimit:MaxRequestsPerWindow"] = "1"
         });
         using var client = factory.CreateClient();
@@ -36,11 +37,11 @@ public sealed class ProxyAndHealthIntegrationTests
         using var factory = CreateFactory(configuration);
         using var client = factory.CreateClient();
 
-        using var first = await GuestRequest(client, "198.51.100.20");
-        using var second = await GuestRequest(client, "198.51.100.21");
+        using var first = await SteamRequest(client, "198.51.100.20");
+        using var second = await SteamRequest(client, "198.51.100.21");
 
-        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
-        Assert.Equal(HttpStatusCode.OK, second.StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, first.StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, second.StatusCode);
     }
 
     [Fact]
@@ -52,6 +53,7 @@ public sealed class ProxyAndHealthIntegrationTests
                 new Dictionary<string, string?>
                 {
                     ["Deployment:Profile"] = "development",
+                    ["Auth:Mode"] = "development-guest",
                     ["ConnectionStrings:DefaultConnection"] = "Host=127.0.0.1;Port=1;Database=unavailable;Username=test;Password=test;Timeout=1;Command Timeout=1"
                 }));
         });
@@ -104,9 +106,24 @@ public sealed class ProxyAndHealthIntegrationTests
         return client.SendAsync(request);
     }
 
+    private static Task<HttpResponseMessage> SteamRequest(HttpClient client, string forwardedFor)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, "/auth/steam")
+        {
+            Content = JsonContent.Create(new { ticket = "" })
+        };
+        request.Headers.TryAddWithoutValidation("X-Forwarded-For", forwardedFor);
+        request.Headers.TryAddWithoutValidation("X-Forwarded-Proto", "https");
+        return client.SendAsync(request);
+    }
+
     private static Dictionary<string, string?> VpsConfiguration() => new()
     {
         ["Deployment:Profile"] = "vps",
+        ["Auth:Mode"] = "steam",
+        ["Steam:ApiKey"] = "test-publisher-key",
+        ["Steam:AppId"] = "5325920",
+        ["Steam:Identity"] = "sloparena-playtest",
         ["ConnectionStrings:DefaultConnection"] = "Host=127.0.0.1;Database=test;Username=test;Password=test",
         ["ApprovedHost:Id"] = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         ["ApprovedHost:RegistrationKey"] = "registration-secret-0123456789abcdef",

@@ -10,6 +10,9 @@ public class Match
     public long? Player4SteamId { get; set; }
     public long? WinnerSteamId { get; set; } // Null for draws or disconnects
     public string ServerRegion { get; set; } = string.Empty;
+    public Guid? ServerId { get; set; }
+    public DateTime? CanceledAt { get; set; }
+    public string? CancelReason { get; set; }
     public DateTime StartedAt { get; set; } = DateTime.UtcNow;
     public DateTime? EndedAt { get; set; }
 

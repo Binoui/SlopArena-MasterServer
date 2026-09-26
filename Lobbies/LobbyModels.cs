@@ -35,17 +35,24 @@ public sealed record LobbySnapshot(Guid ServerId, IReadOnlyList<LobbyPlayer> Pla
 /// </summary>
 public sealed record MatchStartingConfig(Guid ServerId, IReadOnlyList<LobbyPlayer> Players);
 
-/// Payload of the <c>MatchStarted</c> push broadcast when the host starts the
-/// actual match from stage select (all players locked in). Carries the final
-/// roster with characters + entity IDs, the UDP port and arena, plus the
-/// GameServer's opaque authoritative content admission JSON.
-/// </summary>
+/// <summary>Master-issued Steam routing coordinates; all identities serialize losslessly.</summary>
+public sealed record SteamMatchDescriptor(
+    string Transport,
+    string ServerSteamId,
+    Guid MatchId,
+    int VirtualPort,
+    int ProtocolVersion,
+    string ContentHash,
+    DateTimeOffset AdmissionExpiresAtUtc);
+
+/// <summary>Match push sent only to its locked-in roster.</summary>
 public sealed record MatchStartedConfig(
     Guid ServerId,
     IReadOnlyList<LobbyPlayer> Players,
     int MatchPort = 0,
     string ArenaName = "",
-    JsonElement? Content = null);
+    JsonElement? Content = null,
+    SteamMatchDescriptor? Descriptor = null);
 
 /// <summary>
 /// Result of a player entering a GameServer. <c>Success</c> means a waiting
@@ -61,13 +68,9 @@ public sealed record JoinLobbyResult(
     LeaveLobbyResult? Departure,
     bool ServerAdmitted = false);
 
-/// <summary>Authoritative result returned by the game server match-start endpoint.</summary>
-/// <remarks>
-/// <see cref="Content"/> is intentionally an opaque JSON element. The Master
-/// forwards the game server's cooked content admission map to clients without
-/// taking a Shared dependency or interpreting gameplay data.
-/// </remarks>
-public sealed record MatchLaunchResult(int MatchPort, JsonElement Content);
+/// <summary>GameHost match-start response. Master forwards authoritative content unchanged.</summary>
+public sealed record MatchLaunchResult(int MatchPort, JsonElement Content,
+    SteamMatchDescriptor? Descriptor = null);
 
 /// <summary>
 /// Result of a player leaving a lobby (or disconnecting). <c>ServerId</c> is null

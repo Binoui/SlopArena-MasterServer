@@ -41,6 +41,9 @@ public class HttpMatchLauncherTests
         public Uri? RequestUri { get; private set; }
         public HttpStatusCode Status { get; set; } = HttpStatusCode.OK;
         public System.Net.Http.Headers.AuthenticationHeaderValue? Authorization { get; private set; }
+        public bool SteamResponse { get; set; }
+        public string ResponseSteamId { get; set; } = "90293421017699331";
+        public int AbortCalls { get; private set; }
         public string ResponseBody { get; set; } = """{"port":9877,"content":{"schemaVersion":1,"entries":[]}}""";
 
         protected override Task<HttpResponseMessage> SendAsync(
@@ -51,14 +54,30 @@ public class HttpMatchLauncherTests
             RequestBody = request.Content is null
                 ? ""
                 : request.Content.ReadAsStringAsync(ct).Result;
+            if (request.RequestUri?.AbsolutePath == "/match/abort")
+                AbortCalls++;
+            var response = ResponseBody;
+            if (SteamResponse && request.RequestUri?.AbsolutePath == "/match/start")
+            {
+                using var doc = JsonDocument.Parse(RequestBody);
+                response = JsonSerializer.Serialize(new
+                {
+                    matchId = doc.RootElement.GetProperty("matchId").GetString(),
+                    serverSteamId = ResponseSteamId,
+                    virtualPort = 0,
+                    protocolVersion = 2,
+                    contentHash = new string('a', 64),
+                    content = new { schemaVersion = 1, entries = Array.Empty<object>() }
+                });
+            }
             return Task.FromResult(new HttpResponseMessage(Status)
             {
-                Content = new StringContent(ResponseBody, System.Text.Encoding.UTF8, "application/json"),
+                Content = new StringContent(response, System.Text.Encoding.UTF8, "application/json"),
             });
         }
     }
 
-    private static AppDbContext SeedServer(string ip, int port)
+    private static AppDbContext SeedServer(string ip, int port, string? steamId = null)
     {
         var db = CreateInMemoryDb();
         db.GameServers.Add(new GameServer
@@ -70,7 +89,15 @@ public class HttpMatchLauncherTests
             Region = "EU",
             ApiToken = "tok",
             LastHeartbeat = DateTime.UtcNow,
+            SteamId = steamId,
+            ProtocolVersion = steamId is null ? 0 : 2,
+            InstanceId = steamId is null ? null : Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+            CatalogHash = steamId is null ? null : new string('a', 64),
         });
+        if (steamId is not null)
+            db.Users.AddRange(
+                new User { SteamId = 101, AuthProvider = "steam", Username = "Alice" },
+                new User { SteamId = 202, AuthProvider = "steam", Username = "Bob" });
         db.SaveChanges();
         return db;
     }
@@ -132,7 +159,7 @@ public class HttpMatchLauncherTests
     [Fact]
     public async Task LaunchAsync_VpsUsesPrivateControlUrlAndSeparateBearerKey()
     {
-        var handler = new StubHandler();
+        var handler = new StubHandler { SteamResponse = true };
         var deployment = new MasterDeploymentOptions(
             "vps",
             ServerId,
@@ -141,14 +168,40 @@ public class HttpMatchLauncherTests
             9876,
             new Uri("http://gameserver.internal:9876/match/start"),
             "match-control-key");
-        var launcher = CreateLauncher(
-            SeedServer("attacker.example", 4321), new HttpClient(handler), deployment);
+        var db = SeedServer("attacker.example", 4321, "90293421017699331");
+        var launcher = CreateLauncher(db, new HttpClient(handler), deployment);
 
-        await launcher.LaunchAsync(new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court"));
+        var result = await launcher.LaunchAsync(new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court"));
 
         Assert.Equal("http://gameserver.internal:9876/match/start", handler.RequestUri!.ToString());
         Assert.Equal("Bearer", handler.Authorization!.Scheme);
         Assert.Equal("match-control-key", handler.Authorization.Parameter);
+        Assert.NotNull(result.Descriptor);
+        Assert.Equal("90293421017699331", result.Descriptor!.ServerSteamId);
+        Assert.Equal(result.Descriptor.MatchId, Assert.Single(db.Matches).Id);
+        Assert.Equal(2, result.Descriptor.ProtocolVersion);
+        Assert.Equal(0, result.Descriptor.VirtualPort);
+        Assert.Equal(new string('a', 64), result.Descriptor.ContentHash);
+        using var posted = JsonDocument.Parse(handler.RequestBody);
+        Assert.Equal(result.Descriptor.ContentHash, posted.RootElement.GetProperty("catalogHash").GetString());
+    }
+
+    [Fact]
+    public async Task VpsLauncher_RejectsUnexpectedHostAndAbortsAllocatedMatch()
+    {
+        var handler = new StubHandler { SteamResponse = true, ResponseSteamId = "90293421017699399" };
+        var db = SeedServer("attacker.example", 4321, "90293421017699331");
+        var deployment = new MasterDeploymentOptions(
+            "vps", ServerId, "registration-key", "public.example", 9876,
+            new Uri("http://gameserver.internal:9876/match/start"), "match-control-key");
+        var launcher = CreateLauncher(db, new HttpClient(handler), deployment);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            launcher.LaunchAsync(new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court")));
+
+        Assert.Empty(db.Matches);
+        Assert.Equal(1, handler.AbortCalls);
+        Assert.Equal("http://gameserver.internal:9876/match/abort", handler.RequestUri!.ToString());
     }
 
     [Fact]

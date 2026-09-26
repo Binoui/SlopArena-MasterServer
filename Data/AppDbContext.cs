@@ -1,7 +1,6 @@
 // MasterServer/Data/AppDbContext.cs
 using Microsoft.EntityFrameworkCore;
 using MasterServer.Data.Models;
-
 namespace MasterServer.Data;
 
 public class AppDbContext : DbContext
@@ -11,6 +10,7 @@ public class AppDbContext : DbContext
     public DbSet<User> Users { get; set; } = null!;
     public DbSet<Match> Matches { get; set; } = null!;
     public DbSet<GameServer> GameServers { get; set; } = null!;
+    public DbSet<UsedSteamAuthTicket> UsedSteamAuthTickets { get; set; } = null!;
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -18,6 +18,7 @@ public class AppDbContext : DbContext
         modelBuilder.Entity<User>(entity =>
         {
             entity.HasKey(e => e.SteamId);
+            entity.Property(e => e.AuthProvider).HasMaxLength(16).IsRequired();
             entity.Property(e => e.Username).HasMaxLength(64).IsRequired();
             entity.Property(e => e.Mmr).IsRequired();
             entity.Property(e => e.CreatedAt).IsRequired();
@@ -30,6 +31,8 @@ public class AppDbContext : DbContext
             entity.HasIndex(e => e.Player1SteamId);
             entity.HasIndex(e => e.Player2SteamId);
             entity.Property(e => e.ServerRegion).HasMaxLength(16).IsRequired();
+            entity.HasIndex(e => e.ServerId);
+            entity.Property(e => e.CancelReason).HasMaxLength(32);
 
             // Foreign keys use Restrict on removal
             entity.HasOne(e => e.Player1)
@@ -62,6 +65,15 @@ public class AppDbContext : DbContext
             entity.Property(e => e.IpAddress).HasMaxLength(45).IsRequired();
             entity.Property(e => e.Region).HasMaxLength(16).IsRequired();
             entity.Property(e => e.ApiToken).HasMaxLength(128).IsRequired();
+            entity.Property(e => e.SteamId).HasMaxLength(20);
+            entity.Property(e => e.CatalogHash).HasMaxLength(64);
+        });
+
+        modelBuilder.Entity<UsedSteamAuthTicket>(entity =>
+        {
+            entity.HasKey(e => e.Hash);
+            entity.Property(e => e.Hash).HasMaxLength(64).IsRequired();
+            entity.Property(e => e.ConsumedAt).IsRequired();
         });
     }
 }

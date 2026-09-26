@@ -62,6 +62,17 @@ public sealed class HttpMatchLauncher : IMatchLauncher
         if (server is null)
             throw new InvalidOperationException(
                 $"Game server {config.ServerId} is not registered — cannot start match.");
+        if (_deployment.IsVps)
+        {
+            if (server.ProtocolVersion != 2 || string.IsNullOrEmpty(server.SteamId) ||
+                (server.InstanceId is null || server.InstanceId == Guid.Empty) ||
+                server.CatalogHash is not { Length: 64 } ||
+                server.LastHeartbeat < DateTime.UtcNow.AddSeconds(-15))
+                throw new InvalidOperationException("Steam GameHost is not currently registered and ready.");
+        }
+        var instanceAtStart = server.InstanceId;
+        var steamIdAtStart = server.SteamId;
+        var catalogAtStart = server.CatalogHash;
 
         var arena = config.ArenaName;
         var matchGuid = Guid.NewGuid();
@@ -77,6 +88,18 @@ public sealed class HttpMatchLauncher : IMatchLauncher
                 $"Cannot launch match with {players.Count} players " +
                 $"(expected {LobbyLimits.MinPlayers}–{_maxPlayersPerLobby}).");
         }
+        if (_deployment.IsVps)
+        {
+            var identities = players.Select(p => p.SteamId).ToArray();
+            if (identities.Any(id => id <= 0) || identities.Distinct().Count() != identities.Length ||
+                players.Select(p => p.EntityId).Distinct().Count() != players.Count ||
+                players.Any(p => p.EntityId <= 0 || string.IsNullOrEmpty(p.Character)))
+                throw new InvalidOperationException("Match roster is not a unique assigned Steam roster.");
+            int verified = await _db.Users.CountAsync(user => identities.Contains(user.SteamId) &&
+                user.AuthProvider == "steam");
+            if (verified != identities.Length)
+                throw new InvalidOperationException("Every roster member must have a verified Steam identity.");
+        }
 
         // Create the Match row up front so the game server's later
         // POST /match/result finds it (issue #40). Rolled back on launch failure.
@@ -87,17 +110,18 @@ public sealed class HttpMatchLauncher : IMatchLauncher
             Player2SteamId = players[1].SteamId,
             Player3SteamId = players.Count > 2 ? players[2].SteamId : null,
             Player4SteamId = players.Count > 3 ? players[3].SteamId : null,
+            ServerId = server.Id,
             ServerRegion = server.Region,
             StartedAt = DateTime.UtcNow,
         });
         await _db.SaveChangesAsync();
 
-        var body = new
+        var admissionDeadline = DateTimeOffset.UtcNow.AddSeconds(60);
+        var body = new Dictionary<string, object?>
         {
-            matchId,
-            arenaName = arena,
-            players = config.Players
-                .Select(p => new
+            ["matchId"] = matchId,
+            ["arenaName"] = arena,
+            ["players"] = config.Players.Select(p => new
                 {
                     steamId = p.SteamId,
                     // Wire key stays `characterClass` — the game server's
@@ -107,6 +131,14 @@ public sealed class HttpMatchLauncher : IMatchLauncher
                 })
                 .ToArray(),
         };
+        if (_deployment.IsVps)
+        {
+            body["protocolVersion"] = 2;
+            body["virtualPort"] = 0;
+            body["maxStocks"] = 3;
+            body["catalogHash"] = catalogAtStart;
+            body["admissionExpiresAtUtc"] = admissionDeadline;
+        }
 
         var url = _deployment.IsVps
             ? _deployment.ControlUrl!
@@ -115,6 +147,7 @@ public sealed class HttpMatchLauncher : IMatchLauncher
             "Launching match {MatchId} on server {ServerId} with {Count} players",
             matchId, config.ServerId, config.Players.Count);
 
+        bool launchSent = false;
         try
         {
             using var request = new HttpRequestMessage(HttpMethod.Post, url)
@@ -124,21 +157,53 @@ public sealed class HttpMatchLauncher : IMatchLauncher
             if (_deployment.IsVps)
                 request.Headers.Authorization =
                     new AuthenticationHeaderValue("Bearer", _deployment.MatchControlKey!);
+            launchSent = true;
             using var response = await _http.SendAsync(request);
             response.EnsureSuccessStatusCode();
 
             var result = await response.Content.ReadFromJsonAsync<MatchStartResponse>();
-            if (result is null || result.Port <= 0
-                || result.Content.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
-                throw new InvalidOperationException(
-                    $"Game server {config.ServerId} did not return a valid match port/content payload.");
-
-            _logger.LogInformation(
-                "Match {MatchId} launched on port {Port}", matchId, result.Port);
+            if (result is null || result.Content.ValueKind != JsonValueKind.Object)
+                throw new InvalidOperationException("GameHost did not return match content.");
+            if (_deployment.IsVps)
+            {
+                await _db.Entry(server).ReloadAsync();
+                if (result.MatchId != matchGuid || result.ServerSteamId != steamIdAtStart ||
+                    server.SteamId != steamIdAtStart || server.InstanceId != instanceAtStart ||
+                    server.CatalogHash != catalogAtStart || result.ContentHash != catalogAtStart ||
+                    server.ProtocolVersion != 2 || server.LastHeartbeat < DateTime.UtcNow.AddSeconds(-15) ||
+                    result.ProtocolVersion != 2 || result.VirtualPort != 0)
+                    throw new InvalidOperationException("GameHost returned an incompatible or stale Steam match route.");
+                var descriptor = new SteamMatchDescriptor("steam-p2p", result.ServerSteamId!,
+                    matchGuid, 0, 2, result.ContentHash!, admissionDeadline);
+                _logger.LogInformation("Steam match {MatchId} launched on host {ServerId}", matchId, server.Id);
+                return new MatchLaunchResult(0, result.Content.Clone(), descriptor);
+            }
+            if (result.Port <= 0)
+                throw new InvalidOperationException("Development GameServer did not return a match port.");
             return new MatchLaunchResult(result.Port, result.Content.Clone());
         }
         catch
         {
+            if (_deployment.IsVps && launchSent)
+            {
+                try
+                {
+                    using var abort = new HttpRequestMessage(HttpMethod.Post,
+                        new Uri(_deployment.ControlUrl!, "/match/abort"))
+                    {
+                        Content = JsonContent.Create(new { matchId })
+                    };
+                    abort.Headers.Authorization =
+                        new AuthenticationHeaderValue("Bearer", _deployment.MatchControlKey!);
+                    using var aborted = await _http.SendAsync(abort);
+                    if (!aborted.IsSuccessStatusCode)
+                        _logger.LogWarning("GameHost did not acknowledge abort for match {MatchId}.", matchId);
+                }
+                catch (Exception)
+                {
+                    _logger.LogWarning("GameHost abort unavailable for match {MatchId}.", matchId);
+                }
+            }
             // Roll the pre-created row back so a failed launch leaves no orphan.
             var row = await _db.Matches.FindAsync(matchGuid);
             if (row != null)
@@ -153,6 +218,11 @@ public sealed class HttpMatchLauncher : IMatchLauncher
     private sealed class MatchStartResponse
     {
         public int Port { get; set; }
+        public Guid MatchId { get; set; }
+        public string? ServerSteamId { get; set; }
+        public int VirtualPort { get; set; }
+        public int ProtocolVersion { get; set; }
+        public string? ContentHash { get; set; }
         public JsonElement Content { get; set; }
     }
 }

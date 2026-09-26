@@ -10,5 +10,9 @@ public record ServerRegistrationRequest(
     bool IsOfficial,
     int MaxConcurrentMatches,
     string? CustomRulesJson,
-    Guid? HostId = null
+    Guid? HostId = null,
+    string? SteamId = null,
+    int ProtocolVersion = 0,
+    Guid? InstanceId = null,
+    string? CatalogHash = null
 );

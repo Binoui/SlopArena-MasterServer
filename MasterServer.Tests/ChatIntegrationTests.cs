@@ -61,6 +61,7 @@ public class ChatIntegrationTests : IDisposable
             builder.ConfigureAppConfiguration((_, config) => config.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["Deployment:Profile"] = "development",
+                ["Auth:Mode"] = "development-guest",
                 ["RateLimit:MaxRequestsPerWindow"] = httpRateLimit.ToString(),
             }));
             builder.ConfigureServices(services =>
@@ -235,7 +236,7 @@ public class ChatIntegrationTests : IDisposable
         var carolConn = await ConnectAsync(factory, carolToken);
 
         // Bob is in a lobby, Carol is not in any — Global must reach both.
-        await bobConn.InvokeAsync("JoinLobby", serverA);
+        await bobConn.InvokeAsync("JoinLobby", serverA, 0);
 
         var bobWait = WaitForPushAsync<ChatMessage>(bobConn, "ChatMessage", m => m.Channel == "global");
         var carolWait = WaitForPushAsync<ChatMessage>(carolConn, "ChatMessage", m => m.Channel == "global");
@@ -270,9 +271,9 @@ public class ChatIntegrationTests : IDisposable
         var carolMessages = new ConcurrentQueue<ChatMessage>();
         using var carolRegistration = carolConn.On<ChatMessage>("ChatMessage", carolMessages.Enqueue);
 
-        await aliceConn.InvokeAsync("JoinLobby", serverA);
-        await bobConn.InvokeAsync("JoinLobby", serverA);
-        await carolConn.InvokeAsync("JoinLobby", serverB);
+        await aliceConn.InvokeAsync("JoinLobby", serverA, 0);
+        await bobConn.InvokeAsync("JoinLobby", serverA, 0);
+        await carolConn.InvokeAsync("JoinLobby", serverB, 0);
 
         var bobWait = WaitForPushAsync<ChatMessage>(bobConn, "ChatMessage", m => m.Channel == "server");
         var sent = await aliceConn.InvokeAsync<ChatMessage>("SendServer", serverA, "for server A only");
@@ -292,13 +293,13 @@ public class ChatIntegrationTests : IDisposable
 
         // An unregistered/unknown server id is rejected before any lobby state changes.
         var unknown = await Assert.ThrowsAsync<HubException>(
-            () => aliceConn.InvokeAsync("JoinLobby", Guid.NewGuid()));
+            () => aliceConn.InvokeAsync("JoinLobby", Guid.NewGuid(), 0));
         Assert.Contains("server_unavailable", unknown.Message);
         Assert.Equal(serverA, (await aliceConn.InvokeAsync<ChatSnapshot>("GetChatState")).Server.ServerId);
 
         var switched = WaitForPushAsync<ServerChatState>(aliceConn, "ChatServerChanged",
             state => state.ServerId == serverB);
-        await aliceConn.InvokeAsync("JoinLobby", serverB);
+        await aliceConn.InvokeAsync("JoinLobby", serverB, 0);
         Assert.Empty((await switched).Messages);
         var oldServer = await Assert.ThrowsAsync<HubException>(
             () => aliceConn.InvokeAsync<ChatMessage>("SendServer", serverA, "old server draft"));
@@ -387,7 +388,7 @@ public class ChatIntegrationTests : IDisposable
         Assert.True(presencePush.Online);
 
         // Once a connection of this identity has joined a GameServer, rename is blocked.
-        await aliceConn.InvokeAsync("JoinLobby", serverA);
+        await aliceConn.InvokeAsync("JoinLobby", serverA, 0);
         var blocked = await SetDisplayNameRawAsync(client, aliceToken, "TryAgain");
         Assert.Equal(HttpStatusCode.Conflict, blocked.StatusCode);
         var blockedBody = await blocked.Content.ReadFromJsonAsync<JsonElement>();
@@ -411,7 +412,7 @@ public class ChatIntegrationTests : IDisposable
 
         var bobConn = await ConnectAsync(factory, bobToken);
         var aliceConn1 = await ConnectAsync(factory, aliceToken);
-        await aliceConn1.InvokeAsync("JoinLobby", serverA);
+        await aliceConn1.InvokeAsync("JoinLobby", serverA, 0);
 
         // Last connection of an identity disconnecting emits exactly one offline.
         var offlineWait = WaitForPushAsync<ChatPresence>(bobConn, "ChatPresenceChanged",
@@ -431,9 +432,9 @@ public class ChatIntegrationTests : IDisposable
         // A second simultaneous connection for the same identity is allowed
         // (up to 4); only one of them may hold lobby membership at a time.
         var aliceConn3 = await ConnectAsync(factory, aliceToken);
-        await aliceConn2.InvokeAsync("JoinLobby", serverA);
+        await aliceConn2.InvokeAsync("JoinLobby", serverA, 0);
         var duplicateJoin = await Assert.ThrowsAsync<HubException>(
-            () => aliceConn3.InvokeAsync("JoinLobby", serverA));
+            () => aliceConn3.InvokeAsync("JoinLobby", serverA, 0));
         Assert.Contains("already_joined", duplicateJoin.Message);
 
         // Refresh mints a new token for the SAME identity — it never creates a new guest.
@@ -626,7 +627,7 @@ public class ChatIntegrationTests : IDisposable
         var serverA = await RegisterFreshServerAsync(client, "A");
         var serverB = await RegisterFreshServerAsync(client, "B");
         var connection = await ConnectAsync(factory, token);
-        await connection.InvokeAsync("JoinLobby", serverA);
+        await connection.InvokeAsync("JoinLobby", serverA, 0);
         var accepted = new List<ChatMessage>();
         for (var i = 0; i < 55; i++)
         {
@@ -635,14 +636,14 @@ public class ChatIntegrationTests : IDisposable
             accepted.Add(await connection.InvokeAsync<ChatMessage>("SendServer", serverA, $"message-{i}"));
         }
 
-        await connection.InvokeAsync("JoinLobby", serverB);
+        await connection.InvokeAsync("JoinLobby", serverB, 0);
         var otherServer = await connection.InvokeAsync<ChatSnapshot>("GetChatState");
         Assert.Equal(serverB, otherServer.Server.ServerId);
         Assert.Empty(otherServer.Server.Messages);
         Assert.Empty(otherServer.GlobalMessages);
 
         var replay = WaitForPushAsync<ServerChatState>(connection, "ChatServerChanged", state => state.ServerId == serverA);
-        await connection.InvokeAsync("JoinLobby", serverA);
+        await connection.InvokeAsync("JoinLobby", serverA, 0);
         Assert.Equal(accepted.Skip(5).Select(message => message.MessageId),
             (await replay).Messages.Select(message => message.MessageId));
     }
@@ -691,13 +692,13 @@ public class ChatIntegrationTests : IDisposable
         var serverA = await RegisterFreshServerAsync(client, "Resume-A");
         var (token, _) = await RegisterPlayerAsync(client, "Resume");
         var first = await ConnectAsync(factory, token);
-        await first.InvokeAsync("JoinLobby", serverA);
+        await first.InvokeAsync("JoinLobby", serverA, 0);
         await first.DisposeAsync();
 
         var resumed = await ConnectAsync(factory, token);
         var state = WaitForPushAsync<ServerChatState>(
             resumed, "ChatServerChanged", snapshot => snapshot.ServerId == serverA);
-        await resumed.InvokeAsync("ResumeServer", serverA);
+        await resumed.InvokeAsync("ResumeServer", serverA, 0);
         Assert.Equal(serverA, (await state).ServerId);
         await Assert.ThrowsAsync<HubException>(() => resumed.InvokeAsync("HostStart"));
         var accepted = await resumed.InvokeAsync<ChatMessage>(
@@ -707,7 +708,7 @@ public class ChatIntegrationTests : IDisposable
         await resumed.InvokeAsync("LeaveLobby");
         var afterLeave = await ConnectAsync(factory, token);
         var rejected = await Assert.ThrowsAsync<HubException>(
-            () => afterLeave.InvokeAsync("ResumeServer", serverA));
+            () => afterLeave.InvokeAsync("ResumeServer", serverA, 0));
         Assert.Contains("not_admitted", rejected.Message);
     }
     [Fact]
@@ -733,20 +734,20 @@ public class ChatIntegrationTests : IDisposable
         var (travelerToken, _) = await RegisterPlayerAsync(client, "ChangesServer");
         var active = await ConnectAsync(factory, activeToken);
         var traveler = await ConnectAsync(factory, travelerToken);
-        await active.InvokeAsync("JoinLobby", servers[0].Id);
+        await active.InvokeAsync("JoinLobby", servers[0].Id, 0);
         var oldest = await active.InvokeAsync<ChatMessage>("SendServer", servers[0].Id, "keep active history");
         for (var i = 1; i < servers.Length; i++)
         {
             clock.Advance(TimeSpan.FromSeconds(10));
-            await traveler.InvokeAsync("JoinLobby", servers[i].Id);
+            await traveler.InvokeAsync("JoinLobby", servers[i].Id, 0);
             await traveler.InvokeAsync<ChatMessage>("SendServer", servers[i].Id, $"history-{i}");
         }
 
         var activeHistory = await active.InvokeAsync<ChatSnapshot>("GetChatState");
         Assert.Equal(oldest.MessageId, Assert.Single(activeHistory.Server.Messages).MessageId);
-        await traveler.InvokeAsync("JoinLobby", servers[1].Id);
+        await traveler.InvokeAsync("JoinLobby", servers[1].Id, 0);
         Assert.Empty((await traveler.InvokeAsync<ChatSnapshot>("GetChatState")).Server.Messages);
-        await traveler.InvokeAsync("JoinLobby", servers[2].Id);
+        await traveler.InvokeAsync("JoinLobby", servers[2].Id, 0);
         Assert.Equal("history-2", Assert.Single(
             (await traveler.InvokeAsync<ChatSnapshot>("GetChatState")).Server.Messages).Text);
     }
@@ -794,7 +795,7 @@ public class ChatIntegrationTests : IDisposable
         for (var i = 0; i < fighters.Length; i++)
         {
             fighters[i] = await NewPlayer($"Fighter-{i}");
-            await fighters[i].InvokeAsync("JoinLobby", serverA);
+            await fighters[i].InvokeAsync("JoinLobby", serverA, 0);
         }
         for (var i = 0; i < fighters.Length; i++)
             await fighters[i].InvokeAsync("SelectCharacter", "Manki");
@@ -809,13 +810,13 @@ public class ChatIntegrationTests : IDisposable
         for (var i = 0; i < waiting.Length; i++)
         {
             waiting[i] = await NewPlayer($"Waiting-{i}");
-            await waiting[i].InvokeAsync("JoinLobby", serverA);
+            await waiting[i].InvokeAsync("JoinLobby", serverA, 0);
         }
         var full = await NewPlayer("Full-Roster");
         var fullState = WaitForPushAsync<ServerChatState>(
             full, "ChatServerChanged", state => state.ServerId == serverA);
         var fullError = await Assert.ThrowsAsync<HubException>(
-            () => full.InvokeAsync("JoinLobby", serverA));
+            () => full.InvokeAsync("JoinLobby", serverA, 0));
         Assert.Contains("lobby_full", fullError.Message);
         Assert.Equal(serverA, (await fullState).ServerId);
 
@@ -828,7 +829,7 @@ public class ChatIntegrationTests : IDisposable
         await waiting[0].InvokeAsync("StartMatch", "training");
 
         var stranger = await NewPlayer("Other-Server");
-        await stranger.InvokeAsync("JoinLobby", serverB);
+        await stranger.InvokeAsync("JoinLobby", serverB, 0);
         var serverAMembers = fighters.Concat(waiting).Append(full).ToArray();
         var received = serverAMembers
             .Select(connection => WaitForPushAsync<ChatMessage>(
