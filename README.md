@@ -245,6 +245,10 @@ Unity ownership, UI, local mute, drafts, scrollback, and input isolation are sep
    the single `/lobby` SignalR client. Save the display name independently
    of account identity. Names allow duplicates; HTTP and SignalR use the
    same bearer token, and the hub query-token route remains supported.
+   Master closes even an established WebSocket when that JWT expires; it does
+   not trust the client to reconnect voluntarily. A fresh valid token starts a
+   new hub connection and revalidates remembered Server Chat/roster membership.
+   Hub expiration never calls GameHost match cancellation.
 
 Do not log tokens or token-bearing URLs. `GET /auth/me` returns
 `{ steamId, username, mmr, sessionTag }`.

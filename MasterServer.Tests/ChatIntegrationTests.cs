@@ -128,7 +128,7 @@ public class ChatIntegrationTests : IDisposable
         return (guest.Token, profile);
     }
 
-    private async Task<Guid> RegisterFreshServerAsync(HttpClient client, string name)
+    private async Task<ServerRegisterResponse> RegisterFreshServerWithTokenAsync(HttpClient client, string name)
     {
         var response = await client.PostAsJsonAsync("/servers/register", new ServerRegistrationRequest(
             Name: name,
@@ -140,8 +140,11 @@ public class ChatIntegrationTests : IDisposable
             CustomRulesJson: null));
         response.EnsureSuccessStatusCode();
         var body = (await response.Content.ReadFromJsonAsync<ServerRegisterResponse>())!;
-        return body.ServerId;
+        return body;
     }
+
+    private async Task<Guid> RegisterFreshServerAsync(HttpClient client, string name) =>
+        (await RegisterFreshServerWithTokenAsync(client, name)).ServerId;
 
     private async Task<HubConnection> ConnectAsync(WebApplicationFactory<Program> factory, string token, bool readState = true)
     {
@@ -158,6 +161,53 @@ public class ChatIntegrationTests : IDisposable
         if (readState)
             await connection.InvokeAsync<ChatSnapshot>("GetChatState");
         return connection;
+    }
+
+    private async Task<HubConnection> ConnectWebSocketAsync(
+        WebApplicationFactory<Program> factory, string token, bool readState = true)
+    {
+        var connection = new HubConnectionBuilder()
+            .WithUrl(new Uri(factory.Server.BaseAddress, "lobby"), options =>
+            {
+                options.Transports = HttpTransportType.WebSockets;
+                options.HttpMessageHandlerFactory = _ => factory.Server.CreateHandler();
+                options.WebSocketFactory = (context, cancellationToken) =>
+                {
+                    var uri = new UriBuilder(context.Uri);
+                    var query = uri.Query.TrimStart('?');
+                    uri.Query = string.IsNullOrEmpty(query)
+                        ? $"access_token={Uri.EscapeDataString(token)}"
+                        : $"{query}&access_token={Uri.EscapeDataString(token)}";
+                    return new ValueTask<System.Net.WebSockets.WebSocket>(
+                        factory.Server.CreateWebSocketClient().ConnectAsync(uri.Uri, cancellationToken));
+                };
+                options.AccessTokenProvider = () => Task.FromResult<string?>(token);
+            })
+            .Build();
+        _connections.Add(connection);
+        await connection.StartAsync();
+        if (readState)
+            await connection.InvokeAsync<ChatSnapshot>("GetChatState");
+        return connection;
+    }
+
+    private static string IssueTokenWithExpiry(string originalToken, IConfiguration configuration, DateTime expiresAt)
+    {
+        var handler = new JwtSecurityTokenHandler();
+        var original = handler.ReadJwtToken(originalToken);
+        var claims = original.Claims
+            .Where(claim => claim.Type != JwtRegisteredClaimNames.Exp &&
+                claim.Type != JwtRegisteredClaimNames.Jti)
+            .Append(new System.Security.Claims.Claim(
+                JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString("N")));
+        var secret = configuration["Jwt:Secret"]!;
+        return handler.WriteToken(new JwtSecurityToken(
+            original.Issuer,
+            original.Audiences.Single(),
+            claims,
+            expires: expiresAt,
+            signingCredentials: new SigningCredentials(
+                new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret)), SecurityAlgorithms.HmacSha256)));
     }
 
     /// <summary>Registers a handler before the caller triggers the action, avoiding a race on the push.</summary>
@@ -773,6 +823,87 @@ public class ChatIntegrationTests : IDisposable
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
         using var rename = await SetDisplayNameRawAsync(client, expired, "Rejected");
         Assert.Equal(HttpStatusCode.Unauthorized, rename.StatusCode);
+    }
+
+
+    [Fact]
+    public async Task WebSocket_ClosesOnJwtExpiry_AndFreshTokenResumesRememberedServerMembership()
+    {
+        var (factory, client, clock) = CreateFactory();
+        clock.ShiftWallClock(DateTimeOffset.UtcNow - clock.GetUtcNow());
+        var (token, player) = await RegisterPlayerAsync(client, "Expiry");
+        var server = await RegisterFreshServerWithTokenAsync(client, "Expiry-Server");
+        var serverId = server.ServerId;
+        var (observerToken, _) = await RegisterPlayerAsync(client, "Expiry-Observer");
+        var observer = await ConnectAsync(factory, observerToken, readState: false);
+        var offline = WaitForPushAsync<ChatPresence>(
+            observer,
+            "ChatPresenceChanged",
+            presence => presence.Player.PlayerId == player.PlayerId && !presence.Online,
+            TimeSpan.FromSeconds(25));
+
+        var expiringToken = IssueTokenWithExpiry(
+            token,
+            factory.Services.GetRequiredService<IConfiguration>(),
+            DateTime.UtcNow.AddSeconds(15));
+        var connection = await ConnectWebSocketAsync(factory, expiringToken, readState: false);
+        var tokenExpiry = new JwtSecurityTokenHandler().ReadJwtToken(expiringToken).ValidTo;
+        var closed = new TaskCompletionSource<Exception?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        connection.Closed += error =>
+        {
+            closed.TrySetResult(error);
+            return Task.CompletedTask;
+        };
+
+        await connection.InvokeAsync("JoinLobby", serverId, 0);
+        await observer.InvokeAsync("JoinLobby", serverId, 0);
+        await connection.InvokeAsync("SelectCharacter", "Manki");
+        await observer.InvokeAsync("SelectCharacter", "FightGuy");
+        await connection.InvokeAsync("StartStageSelect");
+        await connection.InvokeAsync("StartMatch", "training");
+        var beforeExpiry = await connection.InvokeAsync<ChatMessage>(
+            "SendServer", serverId, "before token expiry");
+        Assert.Equal(serverId, beforeExpiry.ServerId);
+        Assert.Equal(HubConnectionState.Connected, connection.State);
+
+        await closed.Task.WaitAsync(TimeSpan.FromSeconds(25));
+        Assert.True(DateTime.UtcNow >= tokenExpiry);
+        Assert.Equal(HubConnectionState.Disconnected, connection.State);
+        await offline;
+        var survivingMemberMessage = await observer.InvokeAsync<ChatMessage>(
+            "SendServer", serverId, "server chat survives disconnect");
+        Assert.Equal(serverId, survivingMemberMessage.ServerId);
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => connection.InvokeAsync<ChatMessage>("SendGlobal", "after token expiry"));
+
+        using var refresh = new HttpRequestMessage(HttpMethod.Post, "/auth/refresh");
+        refresh.Headers.Authorization = new("Bearer", token);
+        using var refreshResponse = await client.SendAsync(refresh);
+        refreshResponse.EnsureSuccessStatusCode();
+        var freshAuth = (await refreshResponse.Content.ReadFromJsonAsync<GuestAuthResponse>())!;
+        Assert.Equal(player.PlayerId, freshAuth.SteamId.ToString());
+
+        // The GameHost continues heartbeating while the player renews its session.
+        using (var heartbeat = new HttpRequestMessage(HttpMethod.Post, $"/servers/{serverId}/heartbeat")
+            { Content = JsonContent.Create(new HeartbeatRequest(0)) })
+        {
+            heartbeat.Headers.Authorization = new("Bearer", server.ApiToken);
+            using var refreshed = await client.SendAsync(heartbeat);
+            refreshed.EnsureSuccessStatusCode();
+        }
+
+        var reconnected = await ConnectWebSocketAsync(factory, freshAuth.Token, readState: false);
+        var disconnectedState = await reconnected.InvokeAsync<ChatSnapshot>("GetChatState");
+        Assert.Equal(player.PlayerId, disconnectedState.Self.PlayerId);
+        Assert.Null(disconnectedState.Server.ServerId);
+
+        await reconnected.InvokeAsync("ResumeServer", serverId, 0);
+        var resumedState = await reconnected.InvokeAsync<ChatSnapshot>("GetChatState");
+        Assert.Equal(serverId, resumedState.Server.ServerId);
+        var resumedMessage = await reconnected.InvokeAsync<ChatMessage>(
+            "SendServer", serverId, "server chat resumed");
+        Assert.Equal(serverId, resumedMessage.ServerId);
+        Assert.Equal(player.PlayerId, resumedMessage.Sender.PlayerId);
     }
 
     [Fact]

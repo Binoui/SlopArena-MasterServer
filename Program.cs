@@ -875,7 +875,7 @@ app.MapPost("/match/cancel", async (MatchCancelRequest request, HttpContext cont
 });
 
 // ── SignalR lobby hub (issue #32) ──
-app.MapHub<LobbyHub>("/lobby");
+app.MapHub<LobbyHub>("/lobby", options => options.CloseOnAuthenticationExpiration = true);
 
 app.Run();
 
