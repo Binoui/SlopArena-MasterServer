@@ -76,6 +76,7 @@ jobs:
           docker run -d --name "$name" --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
             -e ASPNETCORE_HTTP_PORTS=8080 \
             -e Deployment__Profile=development \
+            -e Auth__Mode=development-guest \
             -e Jwt__Secret=smoke-only-not-a-production-secret-0123456789abcdef \
             -e ConnectionStrings__DefaultConnection='Host=127.0.0.1;Port=1;Database=smoke;Username=smoke;Password=smoke;Timeout=1' \
             -p 127.0.0.1:18080:8080 "$IMAGE:sha-$GITHUB_SHA"
