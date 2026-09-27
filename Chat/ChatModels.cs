@@ -8,14 +8,14 @@ public sealed record ChatMessage(
     Guid MessageId,
     long Sequence,
     string Channel,
-    Guid? ServerId,
+    Guid? RoomId,
     string? RecipientId,
     ChatPlayer Sender,
     string Text,
     DateTimeOffset SentAt);
 
 public sealed record ChatPresence(ChatPlayer Player, bool Online);
-public sealed record ServerChatState(Guid? ServerId, ChatMessage[] Messages);
+public sealed record ServerChatState(Guid? RoomId, ChatMessage[] Messages);
 public sealed record ChatSnapshot(ChatPlayer Self, ChatMessage[] GlobalMessages, ServerChatState Server);
 public sealed record SetDisplayNameRequest(string DisplayName);
 

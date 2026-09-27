@@ -229,6 +229,10 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
 
         Assert.NotEqual(Guid.Empty, result.ServerId);
         Assert.False(string.IsNullOrWhiteSpace(result.ApiToken));
+        var row = await FindGameServerAsync(result.ServerId);
+        Assert.NotNull(row);
+        Assert.NotEqual(result.ApiToken, row.ApiTokenHash);
+        Assert.Equal(64, row.ApiTokenHash.Length);
         Assert.Equal(1, await CountGameServersAsync());
     }
 
@@ -320,7 +324,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         var row = await db.GameServers.SingleAsync();
         Assert.Equal("Renamed Server", row.Name);
         Assert.Equal("US", row.Region);
-        Assert.Equal(second.ApiToken, row.ApiToken);
+        Assert.NotEqual(second.ApiToken, row.ApiTokenHash);
         Assert.NotEqual(first.ApiToken, second.ApiToken);
     }
 
@@ -405,7 +409,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         var after = await FindVpsGameServerAsync(registered.ServerId);
         Assert.NotNull(after);
         Assert.Equal(before.Name, after.Name);
-        Assert.Equal(before.ApiToken, after.ApiToken);
+        Assert.Equal(before.ApiTokenHash, after.ApiTokenHash);
         Assert.Equal(before.IpAddress, after.IpAddress);
         Assert.Equal(before.Port, after.Port);
         Assert.Equal(before.CurrentMatches, after.CurrentMatches);
@@ -434,7 +438,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
 
         Assert.Equal(ApprovedHostId, first.ServerId);
         Assert.Equal(first.ServerId, second.ServerId);
-        Assert.Equal(first.ApiToken, second.ApiToken);
+        Assert.NotEqual(first.ApiToken, second.ApiToken);
         Assert.Equal(1, await CountVpsGameServersAsync());
         var row = await FindVpsGameServerAsync(first.ServerId);
         Assert.NotNull(row);
@@ -445,6 +449,9 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         Assert.Equal(2, row.ProtocolVersion);
         Assert.Equal(3, row.CurrentMatches);
 
+        Assert.NotEqual(second.ApiToken, row.ApiTokenHash);
+        using var staleHeartbeat = await HeartbeatAsync(client, first.ServerId, first.ApiToken);
+        Assert.Equal(HttpStatusCode.Unauthorized, staleHeartbeat.StatusCode);
         using var heartbeatAfterDuplicate = await HeartbeatAsync(
             client, second.ServerId, second.ApiToken, currentMatches: 3);
         Assert.Equal(HttpStatusCode.OK, heartbeatAfterDuplicate.StatusCode);
@@ -458,7 +465,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
             {
                 Id = importedId, Name = "Old imported host", IpAddress = "old.example.net",
                 Port = 28766, Region = "EU", IsOfficial = true,
-                MaxConcurrentMatches = 5, ApiToken = "old-token", LastHeartbeat = DateTime.UtcNow
+                MaxConcurrentMatches = 5, ApiTokenHash = new string('0', 64), LastHeartbeat = DateTime.UtcNow
             });
             await db.SaveChangesAsync();
         }
@@ -466,16 +473,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         browserRequest.Headers.Authorization =
             new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", steamToken);
         using var browserResponse = await client.SendAsync(browserRequest);
-        browserResponse.EnsureSuccessStatusCode();
-        using var browser = System.Text.Json.JsonDocument.Parse(
-            await browserResponse.Content.ReadAsStringAsync());
-        var server = Assert.Single(browser.RootElement.EnumerateArray().ToArray());
-        Assert.Equal("90293421017699331", server.GetProperty("serverSteamId").GetString());
-        Assert.Equal(2, server.GetProperty("protocolVersion").GetInt32());
-        Assert.Equal("game.example.com", server.GetProperty("ipAddress").GetString());
-        Assert.Equal(28765, server.GetProperty("port").GetInt32());
-        Assert.True(server.GetProperty("isOfficial").GetBoolean());
-        Assert.Equal(3, server.GetProperty("currentMatches").GetInt32());
+        Assert.Equal(HttpStatusCode.NotFound, browserResponse.StatusCode);
         using var oldHeartbeat = await HeartbeatAsync(client, importedId, "old-token", currentMatches: 3);
         using var oldResult = await PostMatchResultAsync(client, Guid.NewGuid(), "old-token");
         using var oldDeregister = await DeregisterAsync(client, importedId, "old-token");
@@ -577,19 +575,15 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         using var browser = new HttpRequestMessage(HttpMethod.Get, "/servers");
         browser.Headers.Authorization = new("Bearer", SteamToken(101));
         using var hidden = await client.SendAsync(browser);
-        hidden.EnsureSuccessStatusCode();
-        var list = (await hidden.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>()).EnumerateArray();
-        Assert.Empty(list);
+        Assert.Equal(HttpStatusCode.NotFound, hidden.StatusCode);
 
         var rotated = await RegisterVpsAsync(client,
             VpsRequest() with { CatalogHash = new string('b', 64) });
-        Assert.Equal(first.ApiToken, rotated.ApiToken);
+        Assert.NotEqual(first.ApiToken, rotated.ApiToken);
         using var browserAfter = new HttpRequestMessage(HttpMethod.Get, "/servers");
         browserAfter.Headers.Authorization = new("Bearer", SteamToken(101));
         using var visible = await client.SendAsync(browserAfter);
-        visible.EnsureSuccessStatusCode();
-        var restored = (await visible.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>()).EnumerateArray();
-        Assert.Single(restored);
+        Assert.Equal(HttpStatusCode.NotFound, visible.StatusCode);
         using var stateScope = _vpsFactory.Services.CreateScope();
         var stateDb = stateScope.ServiceProvider.GetRequiredService<AppDbContext>();
         Assert.Null((await stateDb.Matches.FindAsync(activeMatch))!.CanceledAt);
@@ -698,7 +692,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         outsider.On<System.Text.Json.JsonElement>("MatchAborted", _ => Interlocked.Increment(ref leaked));
         await rostered.StartAsync();
         await outsider.StartAsync();
-        await rostered.InvokeAsync("JoinLobby", registered.ServerId, 2);
+        // Match-abort notification is roster-scoped, independent of Room or physical lobby admission.
 
         using var request = new HttpRequestMessage(HttpMethod.Post, "/match/cancel")
         {
@@ -712,11 +706,11 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         Assert.Equal("unfilled", received.GetProperty("reason").GetString());
         Assert.Equal(0, leaked);
         var chat = await rostered.InvokeAsync<MasterServer.Chat.ChatSnapshot>("GetChatState");
-        Assert.Equal(registered.ServerId, chat.Server.ServerId);
+        Assert.Null(chat.Server.RoomId);
     }
 
     [Fact]
-    public async Task VpsLobby_RejectsFreshImportedServerEvenWithKnownId()
+    public async Task VpsLobby_DisablesPhysicalAdmissionEvenForKnownServerId()
     {
         using var client = CreateVpsClient();
         var importedId = Guid.NewGuid();
@@ -727,7 +721,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
             {
                 Id = importedId, Name = "Old imported host", IpAddress = "old.example.net",
                 Port = 28766, Region = "EU", IsOfficial = true, MaxConcurrentMatches = 5,
-                ApiToken = "old-token", LastHeartbeat = DateTime.UtcNow
+                ApiTokenHash = new string('0', 64), LastHeartbeat = DateTime.UtcNow
             });
             db.Users.Add(new User
             {
@@ -748,11 +742,14 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
 
         var error = await Assert.ThrowsAsync<HubException>(() =>
             connection.InvokeAsync("JoinLobby", importedId, 2));
-        Assert.Contains("server_unavailable", error.Message);
+        Assert.Contains("physical_admission_disabled", error.Message);
+        var resume = await Assert.ThrowsAsync<HubException>(() =>
+            connection.InvokeAsync("ResumeServer", importedId, 2));
+        Assert.Contains("physical_admission_disabled", resume.Message);
     }
 
     [Fact]
-    public async Task VpsLobby_RejectsLegacyProtocolBeforeAllocatingRosterSlot()
+    public async Task VpsLobby_DisablesLegacyPhysicalAdmission()
     {
         using var client = CreateVpsClient();
         var registered = await RegisterVpsAsync(client);
@@ -773,15 +770,20 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         await connection.StartAsync();
         var legacy = await Assert.ThrowsAsync<HubException>(() =>
             connection.InvokeAsync("JoinLobby", registered.ServerId, 0));
-        Assert.Contains("incompatible_protocol", legacy.Message);
-        await connection.InvokeAsync("JoinLobby", registered.ServerId, 2);
-        var snapshot = _vpsFactory.Services.GetRequiredService<MasterServer.Lobbies.LobbyManager>()
-            .GetSnapshot(connection.ConnectionId!);
-        Assert.Single(Assert.IsType<MasterServer.Lobbies.LobbySnapshot>(snapshot).Players);
+        Assert.Contains("physical_admission_disabled", legacy.Message);
+        var current = await Assert.ThrowsAsync<HubException>(() =>
+            connection.InvokeAsync("JoinLobby", registered.ServerId, 2));
+        Assert.Contains("physical_admission_disabled", current.Message);
+        var resume = await Assert.ThrowsAsync<HubException>(() =>
+            connection.InvokeAsync("ResumeServer", registered.ServerId, 2));
+        Assert.Contains("physical_admission_disabled", resume.Message);
+        Assert.Null(_vpsFactory.Services.GetRequiredService<MasterServer.Lobbies.LobbyManager>()
+            .GetSnapshot(connection.ConnectionId!));
     }
 
+
     [Fact]
-    public async Task VpsRegistration_ConcurrentRefreshKeepsOneRowStableTokenAndLoad()
+    public async Task VpsRegistration_ConcurrentRefreshKeepsOneRowAndLoad()
     {
         var client = CreateVpsClient();
         var registered = await RegisterVpsAsync(client);
@@ -796,16 +798,20 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
             return (await response.Content.ReadFromJsonAsync<RegisterResponse>())!;
         }));
 
-        Assert.All(results, result =>
-        {
-            Assert.Equal(registered.ServerId, result.ServerId);
-            Assert.Equal(registered.ApiToken, result.ApiToken);
-        });
+        Assert.All(results, result => Assert.Equal(registered.ServerId, result.ServerId));
+        Assert.Equal(8, results.Select(result => result.ApiToken).Distinct().Count());
         Assert.Equal(1, await CountVpsGameServersAsync());
         var row = await FindVpsGameServerAsync(registered.ServerId);
         Assert.NotNull(row);
         Assert.Equal(5, row.CurrentMatches);
-        Assert.Equal(registered.ApiToken, row.ApiToken);
+        var accepted = 0;
+        foreach (var result in results)
+        {
+            using var attempt = await HeartbeatAsync(client, result.ServerId, result.ApiToken, 5);
+            if (attempt.StatusCode == HttpStatusCode.OK) accepted++;
+            else Assert.Equal(HttpStatusCode.Unauthorized, attempt.StatusCode);
+        }
+        Assert.Equal(1, accepted);
     }
 
     [Fact]

@@ -4,10 +4,10 @@ using System.Collections.Concurrent;
 namespace MasterServer.Lobbies;
 
 /// <summary>
-/// In-memory lobby and authoritative GameServer-membership state. Waiting-room
-/// roster capacity is deliberately separate from server membership: once a
-/// match launches, its players leave the roster but remain members of the
-/// GameServer channel until they explicitly leave or switch.
+/// In-memory lobby and authoritative physical GameServer-membership state.
+/// Waiting-roster capacity is separate from GameServer admission: match
+/// players leave the roster but remain members of their GameServer until they
+/// explicitly leave or switch.
 /// </summary>
 public sealed class LobbyManager
 {
@@ -30,9 +30,9 @@ public sealed class LobbyManager
 
     /// <summary>
     /// Admit a connection to a GameServer and, when a waiting slot exists, its
-    /// waiting roster. A full waiting roster does not reject GameServer chat:
-    /// the result is unsuccessful for lobby UI but <see cref="ServerAdmitted"/>
-    /// remains true and the caller has authoritative Server Chat membership.
+    /// waiting roster. A full waiting roster still admits physical GameServer
+    /// membership; <see cref="JoinLobbyResult.GameServerAdmitted"/> remains true
+    /// even when the caller receives a lobby-full result.
     /// </summary>
     public JoinLobbyResult JoinLobby(Guid serverId, string connectionId, long steamId, string username)
     {
@@ -47,7 +47,7 @@ public sealed class LobbyManager
                 && currentLobby == lobby)
             {
                 return new JoinLobbyResult(true, null, currentLobby.GetPlayer(connectionId),
-                    currentLobby.Snapshot(), null, ServerAdmitted: true);
+                    currentLobby.Snapshot(), null, GameServerAdmitted: true);
             }
 
             var joined = lobby.AddPlayer(connectionId, steamId, username);
@@ -64,21 +64,21 @@ public sealed class LobbyManager
                     null,
                     null,
                     departure,
-                    ServerAdmitted: true);
+                    GameServerAdmitted: true);
             }
 
             _lobbyByConnection[connectionId] = lobby;
             _serverByConnection[connectionId] = new ServerMembership(serverId, joined);
             RememberLocked(steamId, serverId, joined);
-            return new JoinLobbyResult(true, null, joined, lobby.Snapshot(), departure, ServerAdmitted: true);
+            return new JoinLobbyResult(true, null, joined, lobby.Snapshot(), departure, GameServerAdmitted: true);
         }
     }
 
     /// <summary>
     /// Reconnect-only admission for an active match connection. It validates a
-    /// remembered identity/server pair and restores only Server Chat membership;
-    /// it never adds a waiting-roster player. The hub validates GameServer
-    /// freshness before calling this method.
+    /// remembered identity/server pair and restores only physical GameServer
+    /// membership; it never adds a waiting-roster player. The hub validates
+    /// GameServer freshness before calling this method.
     /// </summary>
     public bool ResumeServer(Guid serverId, string connectionId, long steamId, string username, out string? error)
     {

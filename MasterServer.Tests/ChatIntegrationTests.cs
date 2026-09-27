@@ -7,6 +7,7 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using MasterServer.Chat;
 using MasterServer.Lobbies;
+using MasterServer.Rooms;
 using MasterServer.Data;
 using MasterServer.DTOs;
 using Microsoft.AspNetCore.Http.Connections;
@@ -49,7 +50,8 @@ public class ChatIntegrationTests : IDisposable
         public Task<MatchLaunchResult> LaunchAsync(MatchStartedConfig config)
             => Task.FromResult(new MatchLaunchResult(
                 9877,
-                JsonDocument.Parse("""{"schemaVersion":1,"entries":[]}""").RootElement.Clone()));
+                JsonDocument.Parse("""{"schemaVersion":1,"entries":[]}""").RootElement.Clone(),
+                MatchId: config.MatchId == Guid.Empty ? Guid.NewGuid() : config.MatchId));
     }
 
     private (WebApplicationFactory<Program> Factory, HttpClient Client, ManualTimeProvider Clock) CreateFactory(int httpRateLimit = 100_000)
@@ -304,63 +306,83 @@ public class ChatIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task SendServer_ScopedToCurrentMembership_RejectsNonMemberAndStaleAndUnknownTarget()
+    public async Task ServerChat_IsRoomScopedAndPhysicalLobbyDoesNotAuthorize()
     {
         var (factory, client, _) = CreateFactory();
-
         var (aliceToken, _) = await RegisterPlayerAsync(client, "Alice");
         var (bobToken, _) = await RegisterPlayerAsync(client, "Bob");
         var (carolToken, _) = await RegisterPlayerAsync(client, "Carol");
+        var (daveToken, _) = await RegisterPlayerAsync(client, "Dave");
+        var gameHost = await RegisterFreshServerAsync(client, "Shared GameHost");
 
-        var serverA = await RegisterFreshServerAsync(client, "ServerA");
-        var serverB = await RegisterFreshServerAsync(client, "ServerB");
+        var alice = await ConnectAsync(factory, aliceToken);
+        var bob = await ConnectAsync(factory, bobToken);
+        var carol = await ConnectAsync(factory, carolToken);
+        var dave = await ConnectAsync(factory, daveToken);
 
-        var aliceConn = await ConnectAsync(factory, aliceToken);
-        var bobConn = await ConnectAsync(factory, bobToken);
-        var carolConn = await ConnectAsync(factory, carolToken);
+        // All three players share one physical host first, then form two
+        // independent Rooms after explicitly leaving its lobby.
+        foreach (var member in new[] { alice, bob, carol })
+            await member.InvokeAsync("JoinLobby", gameHost, 0);
+        foreach (var member in new[] { alice, bob, carol })
+            await member.InvokeAsync("LeaveLobby");
+
+        var aliceRoomState = WaitForPushAsync<ServerChatState>(alice, "ChatServerChanged", _ => true);
+        var roomA = await alice.InvokeAsync<RoomSnapshot>("CreateRoom", "Room A");
+        Assert.Equal(roomA.Id, (await aliceRoomState).RoomId);
+
+        var bobRoomState = WaitForPushAsync<ServerChatState>(bob, "ChatServerChanged", _ => true);
+        await bob.InvokeAsync<RoomSnapshot>("JoinRoom", roomA.Id);
+        Assert.Equal(roomA.Id, (await bobRoomState).RoomId);
+
+        var carolRoomState = WaitForPushAsync<ServerChatState>(carol, "ChatServerChanged", _ => true);
+        var roomB = await carol.InvokeAsync<RoomSnapshot>("CreateRoom", "Room B");
+        Assert.NotEqual(roomA.Id, roomB.Id);
+        Assert.Equal(roomB.Id, (await carolRoomState).RoomId);
+
         var carolMessages = new ConcurrentQueue<ChatMessage>();
-        using var carolRegistration = carolConn.On<ChatMessage>("ChatMessage", carolMessages.Enqueue);
+        using var carolRegistration = carol.On<ChatMessage>("ChatMessage", carolMessages.Enqueue);
+        var bobWait = WaitForPushAsync<ChatMessage>(bob, "ChatMessage",
+            message => message.Channel == "server" && message.RoomId == roomA.Id);
+        var sent = await alice.InvokeAsync<ChatMessage>("SendServer", roomA.Id, "Room A only");
+        var received = await bobWait;
+        Assert.Equal(roomA.Id, sent.RoomId);
+        Assert.Equal(sent.MessageId, received.MessageId);
 
-        await aliceConn.InvokeAsync("JoinLobby", serverA, 0);
-        await bobConn.InvokeAsync("JoinLobby", serverA, 0);
-        await carolConn.InvokeAsync("JoinLobby", serverB, 0);
-
-        var bobWait = WaitForPushAsync<ChatMessage>(bobConn, "ChatMessage", m => m.Channel == "server");
-        var sent = await aliceConn.InvokeAsync<ChatMessage>("SendServer", serverA, "for server A only");
-        var bobReceived = await bobWait;
-
-        Assert.Equal(serverA, sent.ServerId);
-        Assert.Equal(sent.MessageId, bobReceived.MessageId);
-        await FlushMessagesAsync(bobConn, carolConn);
+        await FlushMessagesAsync(bob, carol);
         Assert.DoesNotContain(carolMessages, message => message.MessageId == sent.MessageId);
-        Assert.Empty((await carolConn.InvokeAsync<ChatSnapshot>("GetChatState")).Server.Messages);
+        var roomBSnapshot = await carol.InvokeAsync<ChatSnapshot>("GetChatState");
+        Assert.Equal(roomB.Id, roomBSnapshot.Server.RoomId);
+        Assert.Empty(roomBSnapshot.Server.Messages);
 
-        // Carol is a member of ServerB, not ServerA — a forged target is
-        // rejected outright, never silently rerouted or delivered.
-        var forged = await Assert.ThrowsAsync<HubException>(
-            () => carolConn.InvokeAsync<ChatMessage>("SendServer", serverA, "sneaky"));
-        Assert.Contains("not_in_server", forged.Message);
+        var guessedRoom = await Assert.ThrowsAsync<HubException>(
+            () => carol.InvokeAsync<ChatMessage>("SendServer", roomA.Id, "guessed Room"));
+        Assert.Contains("not_in_room", guessedRoom.Message);
+        await dave.InvokeAsync("JoinLobby", gameHost, 0);
+        var physicalLobby = await Assert.ThrowsAsync<HubException>(
+            () => dave.InvokeAsync<ChatMessage>("SendServer", gameHost, "physical lobby is not chat"));
+        Assert.Contains("not_in_room", physicalLobby.Message);
+        var noRoom = await dave.InvokeAsync<ChatSnapshot>("GetChatState");
+        Assert.Null(noRoom.Server.RoomId);
 
-        // An unregistered/unknown server id is rejected before any lobby state changes.
-        var unknown = await Assert.ThrowsAsync<HubException>(
-            () => aliceConn.InvokeAsync("JoinLobby", Guid.NewGuid(), 0));
-        Assert.Contains("server_unavailable", unknown.Message);
-        Assert.Equal(serverA, (await aliceConn.InvokeAsync<ChatSnapshot>("GetChatState")).Server.ServerId);
-
-        var switched = WaitForPushAsync<ServerChatState>(aliceConn, "ChatServerChanged",
-            state => state.ServerId == serverB);
-        await aliceConn.InvokeAsync("JoinLobby", serverB, 0);
-        Assert.Empty((await switched).Messages);
-        var oldServer = await Assert.ThrowsAsync<HubException>(
-            () => aliceConn.InvokeAsync<ChatMessage>("SendServer", serverA, "old server draft"));
-        Assert.Contains("not_in_server", oldServer.Message);
-
-        var left = WaitForPushAsync<ServerChatState>(aliceConn, "ChatServerChanged", state => state.ServerId is null);
-        await aliceConn.InvokeAsync("LeaveLobby");
+        var left = WaitForPushAsync<ServerChatState>(alice, "ChatServerChanged",
+            state => state.RoomId is null);
+        await alice.InvokeAsync("LeaveRoom");
         Assert.Empty((await left).Messages);
-        var stale = await Assert.ThrowsAsync<HubException>(
-            () => aliceConn.InvokeAsync<ChatMessage>("SendServer", serverB, "still there?"));
-        Assert.Contains("not_in_server", stale.Message);
+        var nextRoomChanged = WaitForPushAsync<ServerChatState>(alice, "ChatServerChanged",
+            state => state.RoomId is not null);
+        var nextRoom = await alice.InvokeAsync<RoomSnapshot>("CreateRoom", "Room C");
+        Assert.NotEqual(roomA.Id, nextRoom.Id);
+        Assert.Equal(nextRoom.Id, (await nextRoomChanged).RoomId);
+        var staleSend = await Assert.ThrowsAsync<HubException>(
+            () => alice.InvokeAsync<ChatMessage>("SendServer", roomA.Id, "stale draft from prior Room"));
+        Assert.Contains("not_in_room", staleSend.Message);
+        var nextRoomSnapshot = await alice.InvokeAsync<ChatSnapshot>("GetChatState");
+        Assert.Equal(nextRoom.Id, nextRoomSnapshot.Server.RoomId);
+        Assert.Empty(nextRoomSnapshot.Server.Messages);
+        var bobHistory = await bob.InvokeAsync<ChatSnapshot>("GetChatState");
+        Assert.Equal(roomA.Id, bobHistory.Server.RoomId);
+        Assert.Contains(bobHistory.Server.Messages, message => message.MessageId == sent.MessageId);
     }
 
     [Fact]
@@ -427,7 +449,13 @@ public class ChatIntegrationTests : IDisposable
         var aliceConn = await ConnectAsync(factory, aliceToken);
         var bobConn = await ConnectAsync(factory, bobToken);
 
-        // A valid rename while online broadcasts the updated profile.
+        var room = await aliceConn.InvokeAsync<RoomSnapshot>("CreateRoom", "Before rename");
+        await bobConn.InvokeAsync<RoomSnapshot>("JoinRoom", room.Id);
+        var roomRenameWait = WaitForPushAsync<RoomSnapshot>(bobConn, "RoomUpdated",
+            snapshot => snapshot.Members.Any(member =>
+                member.SteamId == room.LeaderSteamId && member.Name == "Renamed"));
+
+        // A valid rename while online broadcasts the updated chat profile and Room roster.
         var renameWait = WaitForPushAsync<ChatPresence>(bobConn, "ChatPresenceChanged",
             p => p.Player.PlayerId == alice.PlayerId && p.Player.DisplayName == "Renamed");
         var renamed = await SetDisplayNameAsync(client, aliceToken, "Renamed");
@@ -436,6 +464,11 @@ public class ChatIntegrationTests : IDisposable
         Assert.Equal(alice.SessionTag, renamed.SessionTag);
         var presencePush = await renameWait;
         Assert.True(presencePush.Online);
+        var roomUpdated = await roomRenameWait;
+        var renamedMember = Assert.Single(roomUpdated.Members,
+            member => member.SteamId == room.LeaderSteamId);
+        Assert.Equal("Renamed", renamedMember.Name);
+        await aliceConn.InvokeAsync("LeaveRoom");
 
         // Once a connection of this identity has joined a GameServer, rename is blocked.
         await aliceConn.InvokeAsync("JoinLobby", serverA, 0);
@@ -476,7 +509,7 @@ public class ChatIntegrationTests : IDisposable
         var snapshot = await aliceConn2.InvokeAsync<ChatSnapshot>("GetChatState");
         Assert.Equal(alice.PlayerId, snapshot.Self.PlayerId);
         Assert.Equal(alice.SessionTag, snapshot.Self.SessionTag);
-        Assert.Null(snapshot.Server.ServerId);
+        Assert.Null(snapshot.Server.RoomId);
         Assert.Empty(snapshot.Server.Messages);
 
         // A second simultaneous connection for the same identity is allowed
@@ -670,32 +703,42 @@ public class ChatIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task ServerBacklog_IsBoundedAndRestoredOnlyForTheJoinedServer()
+    public async Task RoomBacklog_IsBoundedAndRestoredOnlyForTheJoinedRoom()
     {
         var (factory, client, clock) = CreateFactory();
-        var (token, _) = await RegisterPlayerAsync(client, "History");
-        var serverA = await RegisterFreshServerAsync(client, "A");
-        var serverB = await RegisterFreshServerAsync(client, "B");
-        var connection = await ConnectAsync(factory, token);
-        await connection.InvokeAsync("JoinLobby", serverA, 0);
+        var (aliceToken, _) = await RegisterPlayerAsync(client, "Alice");
+        var (bobToken, _) = await RegisterPlayerAsync(client, "Bob");
+        var alice = await ConnectAsync(factory, aliceToken);
+        var bob = await ConnectAsync(factory, bobToken);
+        var roomA = await alice.InvokeAsync<RoomSnapshot>("CreateRoom", "A");
         var accepted = new List<ChatMessage>();
         for (var i = 0; i < 55; i++)
         {
             if (i % 5 == 0)
                 clock.Advance(TimeSpan.FromSeconds(5));
-            accepted.Add(await connection.InvokeAsync<ChatMessage>("SendServer", serverA, $"message-{i}"));
+            accepted.Add(await alice.InvokeAsync<ChatMessage>("SendServer", roomA.Id, $"message-{i}"));
         }
 
-        await connection.InvokeAsync("JoinLobby", serverB, 0);
-        var otherServer = await connection.InvokeAsync<ChatSnapshot>("GetChatState");
-        Assert.Equal(serverB, otherServer.Server.ServerId);
-        Assert.Empty(otherServer.Server.Messages);
-        Assert.Empty(otherServer.GlobalMessages);
+        var roomBChanged = WaitForPushAsync<ServerChatState>(bob, "ChatServerChanged", _ => true);
+        var roomB = await bob.InvokeAsync<RoomSnapshot>("CreateRoom", "B");
+        var roomBSnapshot = await bob.InvokeAsync<ChatSnapshot>("GetChatState");
+        Assert.Equal(roomB.Id, roomBSnapshot.Server.RoomId);
+        Assert.Empty(roomBSnapshot.Server.Messages);
+        Assert.Empty(roomBSnapshot.GlobalMessages);
+        Assert.Equal(roomB.Id, (await roomBChanged).RoomId);
 
-        var replay = WaitForPushAsync<ServerChatState>(connection, "ChatServerChanged", state => state.ServerId == serverA);
-        await connection.InvokeAsync("JoinLobby", serverA, 0);
+        var left = WaitForPushAsync<ServerChatState>(bob, "ChatServerChanged", state => state.RoomId is null);
+        await bob.InvokeAsync("LeaveRoom");
+        Assert.Null((await left).RoomId);
+
+        var replay = WaitForPushAsync<ServerChatState>(bob, "ChatServerChanged",
+            state => state.RoomId == roomA.Id);
+        await bob.InvokeAsync<RoomSnapshot>("JoinRoom", roomA.Id);
+        var replayed = (await replay).Messages;
+        Assert.Equal(50, replayed.Length);
         Assert.Equal(accepted.Skip(5).Select(message => message.MessageId),
-            (await replay).Messages.Select(message => message.MessageId));
+            replayed.Select(message => message.MessageId));
+        Assert.All(replayed, message => Assert.Equal(roomA.Id, message.RoomId));
     }
 
     [Fact]
@@ -736,7 +779,7 @@ public class ChatIntegrationTests : IDisposable
 
 
     [Fact]
-    public async Task ResumeServer_RevalidatesPriorAdmissionWithoutWaitingRoster()
+    public async Task ResumeServer_RevalidatesGameServerAdmissionWithoutGrantingServerChat()
     {
         var (factory, client, _) = CreateFactory();
         var serverA = await RegisterFreshServerAsync(client, "Resume-A");
@@ -746,60 +789,19 @@ public class ChatIntegrationTests : IDisposable
         await first.DisposeAsync();
 
         var resumed = await ConnectAsync(factory, token);
-        var state = WaitForPushAsync<ServerChatState>(
-            resumed, "ChatServerChanged", snapshot => snapshot.ServerId == serverA);
+        Assert.Null((await resumed.InvokeAsync<ChatSnapshot>("GetChatState")).Server.RoomId);
         await resumed.InvokeAsync("ResumeServer", serverA, 0);
-        Assert.Equal(serverA, (await state).ServerId);
+        Assert.Null((await resumed.InvokeAsync<ChatSnapshot>("GetChatState")).Server.RoomId);
         await Assert.ThrowsAsync<HubException>(() => resumed.InvokeAsync("HostStart"));
-        var accepted = await resumed.InvokeAsync<ChatMessage>(
-            "SendServer", serverA, "resume retains chat only");
-        Assert.Equal(serverA, accepted.ServerId);
+        var rejected = await Assert.ThrowsAsync<HubException>(
+            () => resumed.InvokeAsync<ChatMessage>("SendServer", serverA, "physical membership is not chat"));
+        Assert.Contains("not_in_room", rejected.Message);
 
         await resumed.InvokeAsync("LeaveLobby");
         var afterLeave = await ConnectAsync(factory, token);
-        var rejected = await Assert.ThrowsAsync<HubException>(
+        var notAdmitted = await Assert.ThrowsAsync<HubException>(
             () => afterLeave.InvokeAsync("ResumeServer", serverA, 0));
-        Assert.Contains("not_admitted", rejected.Message);
-    }
-    [Fact]
-    public async Task ServerHistoryCapacity_EvictsAnIdleChannelButPreservesAnActiveOne()
-    {
-        var (factory, client, clock) = CreateFactory();
-        var servers = Enumerable.Range(0, 257).Select(index => new MasterServer.Data.Models.GameServer
-        {
-            Id = Guid.NewGuid(),
-            Name = $"Server-{index}",
-            IpAddress = "203.0.113.60",
-            Port = 20000 + index,
-            LastHeartbeat = DateTime.UtcNow
-        }).ToArray();
-        using (var scope = factory.Services.CreateScope())
-        {
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            db.GameServers.AddRange(servers);
-            await db.SaveChangesAsync();
-        }
-
-        var (activeToken, _) = await RegisterPlayerAsync(client, "StaysJoined");
-        var (travelerToken, _) = await RegisterPlayerAsync(client, "ChangesServer");
-        var active = await ConnectAsync(factory, activeToken);
-        var traveler = await ConnectAsync(factory, travelerToken);
-        await active.InvokeAsync("JoinLobby", servers[0].Id, 0);
-        var oldest = await active.InvokeAsync<ChatMessage>("SendServer", servers[0].Id, "keep active history");
-        for (var i = 1; i < servers.Length; i++)
-        {
-            clock.Advance(TimeSpan.FromSeconds(10));
-            await traveler.InvokeAsync("JoinLobby", servers[i].Id, 0);
-            await traveler.InvokeAsync<ChatMessage>("SendServer", servers[i].Id, $"history-{i}");
-        }
-
-        var activeHistory = await active.InvokeAsync<ChatSnapshot>("GetChatState");
-        Assert.Equal(oldest.MessageId, Assert.Single(activeHistory.Server.Messages).MessageId);
-        await traveler.InvokeAsync("JoinLobby", servers[1].Id, 0);
-        Assert.Empty((await traveler.InvokeAsync<ChatSnapshot>("GetChatState")).Server.Messages);
-        await traveler.InvokeAsync("JoinLobby", servers[2].Id, 0);
-        Assert.Equal("history-2", Assert.Single(
-            (await traveler.InvokeAsync<ChatSnapshot>("GetChatState")).Server.Messages).Text);
+        Assert.Contains("not_admitted", notAdmitted.Message);
     }
 
     [Fact]
@@ -827,7 +829,7 @@ public class ChatIntegrationTests : IDisposable
 
 
     [Fact]
-    public async Task WebSocket_ClosesOnJwtExpiry_AndFreshTokenResumesRememberedServerMembership()
+    public async Task WebSocket_ClosesOnJwtExpiry_AndFreshTokenResumesLobbyMembershipWithoutServerChat()
     {
         var (factory, client, clock) = CreateFactory();
         clock.ShiftWallClock(DateTimeOffset.UtcNow - clock.GetUtcNow());
@@ -861,18 +863,16 @@ public class ChatIntegrationTests : IDisposable
         await observer.InvokeAsync("SelectCharacter", "FightGuy");
         await connection.InvokeAsync("StartStageSelect");
         await connection.InvokeAsync("StartMatch", "training");
-        var beforeExpiry = await connection.InvokeAsync<ChatMessage>(
-            "SendServer", serverId, "before token expiry");
-        Assert.Equal(serverId, beforeExpiry.ServerId);
+        var rejectedBeforeExpiry = await Assert.ThrowsAsync<HubException>(
+            () => connection.InvokeAsync<ChatMessage>("SendServer", serverId, "physical lobby is not chat"));
+        Assert.Contains("not_in_room", rejectedBeforeExpiry.Message);
         Assert.Equal(HubConnectionState.Connected, connection.State);
 
         await closed.Task.WaitAsync(TimeSpan.FromSeconds(25));
         Assert.True(DateTime.UtcNow >= tokenExpiry);
         Assert.Equal(HubConnectionState.Disconnected, connection.State);
         await offline;
-        var survivingMemberMessage = await observer.InvokeAsync<ChatMessage>(
-            "SendServer", serverId, "server chat survives disconnect");
-        Assert.Equal(serverId, survivingMemberMessage.ServerId);
+        Assert.Null((await observer.InvokeAsync<ChatSnapshot>("GetChatState")).Server.RoomId);
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => connection.InvokeAsync<ChatMessage>("SendGlobal", "after token expiry"));
 
@@ -895,19 +895,19 @@ public class ChatIntegrationTests : IDisposable
         var reconnected = await ConnectWebSocketAsync(factory, freshAuth.Token, readState: false);
         var disconnectedState = await reconnected.InvokeAsync<ChatSnapshot>("GetChatState");
         Assert.Equal(player.PlayerId, disconnectedState.Self.PlayerId);
-        Assert.Null(disconnectedState.Server.ServerId);
+        Assert.Null(disconnectedState.Server.RoomId);
 
         await reconnected.InvokeAsync("ResumeServer", serverId, 0);
         var resumedState = await reconnected.InvokeAsync<ChatSnapshot>("GetChatState");
-        Assert.Equal(serverId, resumedState.Server.ServerId);
-        var resumedMessage = await reconnected.InvokeAsync<ChatMessage>(
-            "SendServer", serverId, "server chat resumed");
-        Assert.Equal(serverId, resumedMessage.ServerId);
-        Assert.Equal(player.PlayerId, resumedMessage.Sender.PlayerId);
+        Assert.Null(resumedState.Server.RoomId);
+        var rejectedAfterResume = await Assert.ThrowsAsync<HubException>(
+            () => reconnected.InvokeAsync<ChatMessage>("SendServer", serverId, "still not Room chat"));
+        Assert.Contains("not_in_room", rejectedAfterResume.Message);
+        Assert.Equal(player.PlayerId, resumedState.Self.PlayerId);
     }
 
     [Fact]
-    public async Task ServerChat_UsesGameServerMembershipAcrossMatchesAndFullWaitingRoster()
+    public async Task PhysicalLobbyMembershipDoesNotAuthorizeServerChatAcrossMatchesAndRosters()
     {
         var (factory, client, _) = CreateFactory();
         var serverA = await RegisterFreshServerAsync(client, "Shared-A");
@@ -932,11 +932,8 @@ public class ChatIntegrationTests : IDisposable
             await fighters[i].InvokeAsync("SelectCharacter", "Manki");
         await fighters[0].InvokeAsync("StartStageSelect");
         await fighters[0].InvokeAsync("StartMatch", "training");
-
-        // Fill a fresh waiting roster on the same GameServer, then prove a
-        // fifth waiting join is still admitted to Server Chat but not the
-        // roster. The caller sees both the honest lobby_full error and its
-        // authoritative ChatServerChanged state.
+        // Fill a fresh waiting roster on the same GameServer; lobby admission
+        // does not grant Server Chat.
         var waiting = new HubConnection[4];
         for (var i = 0; i < waiting.Length; i++)
         {
@@ -944,16 +941,10 @@ public class ChatIntegrationTests : IDisposable
             await waiting[i].InvokeAsync("JoinLobby", serverA, 0);
         }
         var full = await NewPlayer("Full-Roster");
-        var fullState = WaitForPushAsync<ServerChatState>(
-            full, "ChatServerChanged", state => state.ServerId == serverA);
         var fullError = await Assert.ThrowsAsync<HubException>(
             () => full.InvokeAsync("JoinLobby", serverA, 0));
         Assert.Contains("lobby_full", fullError.Message);
-        Assert.Equal(serverA, (await fullState).ServerId);
-
-        // The waiting four launch a second match on the same GameServer. Both
-        // match groups and the waiting-only/full connections must share one
-        // Server Chat audience, while another GameServer remains private.
+        // Match launch keeps the waiting-roster transition independent of chat.
         for (var i = 0; i < waiting.Length; i++)
             await waiting[i].InvokeAsync("SelectCharacter", "FightGuy");
         await waiting[0].InvokeAsync("StartStageSelect");
@@ -962,18 +953,16 @@ public class ChatIntegrationTests : IDisposable
         var stranger = await NewPlayer("Other-Server");
         await stranger.InvokeAsync("JoinLobby", serverB, 0);
         var serverAMembers = fighters.Concat(waiting).Append(full).ToArray();
-        var received = serverAMembers
-            .Select(connection => WaitForPushAsync<ChatMessage>(
-                connection, "ChatMessage", message => message.Channel == "server"
-                    && message.ServerId == serverA))
-            .ToArray();
-        var strangerMessages = new ConcurrentQueue<ChatMessage>();
-        using var strangerRegistration = stranger.On<ChatMessage>("ChatMessage", strangerMessages.Enqueue);
+        foreach (var member in serverAMembers)
+        {
+            var rejected = await Assert.ThrowsAsync<HubException>(
+                () => member.InvokeAsync<ChatMessage>("SendServer", serverA, "GameServer is not a Room"));
+            Assert.Contains("not_in_room", rejected.Message);
+            Assert.Null((await member.InvokeAsync<ChatSnapshot>("GetChatState")).Server.RoomId);
+        }
 
-        var sent = await fighters[0].InvokeAsync<ChatMessage>(
-            "SendServer", serverA, "one GameServer across waiting and matches");
-        Assert.All(await Task.WhenAll(received), message => Assert.Equal(sent.MessageId, message.MessageId));
-        await Task.Delay(100);
-        Assert.DoesNotContain(strangerMessages, message => message.MessageId == sent.MessageId);
+        var strangerRejected = await Assert.ThrowsAsync<HubException>(
+            () => stranger.InvokeAsync<ChatMessage>("SendServer", serverB, "neither host grants chat"));
+        Assert.Contains("not_in_room", strangerRejected.Message);
     }
 }

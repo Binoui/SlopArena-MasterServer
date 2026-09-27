@@ -1,18 +1,20 @@
 // MasterServer/Chat/ChatService.cs
 using System.Globalization;
+using MasterServer.Rooms;
 using MasterServer.Lobbies;
 using Microsoft.AspNetCore.SignalR;
 
 namespace MasterServer.Chat;
 
 /// <summary>
-/// In-memory chat state authority: presence, profiles, public history, and the
+/// In-memory chat authority for presence, profiles, public histories, and
 /// shared per-identity send/control quotas. One lock guards every mutation
 /// (presence, profile, rate windows, history, recipient snapshots) so a caller
 /// gets an atomic accept-or-reject with no partial registration; nothing async
 /// or network/DB-bound ever runs while the lock is held. <see cref="MembershipGate"/>
-/// is a *separate* semaphore that callers hold around DB-backed rename/join
-/// transitions to linearize them against each other — sends never take it.
+/// serializes Room membership changes with Server Chat delivery and DB-backed
+/// rename transitions. <see cref="MembershipSync"/> is the lock used to keep
+/// RoomManager attachments/membership consistent with chat connection state.
 /// </summary>
 public sealed class ChatService
 {
@@ -21,12 +23,9 @@ public sealed class ChatService
     private const int MaxOnlineIdentities = 256;
     private const int MaxConnectionsPerIdentity = 4;
 
-    // Public history depth per channel, and how many distinct GameServer
-    // backlogs are retained at once. Active GameServers can never exceed the
-    // online identity count (one joined connection per identity), so 256 is
-    // never tighter than reality.
+    // Each public history is capped; RoomManager's five-Room ceiling also
+    // bounds the number of Room backlogs retained at once.
     private const int MaxHistoryPerChannel = 50;
-    private const int MaxServerBacklogs = 256;
 
     // Shared send quota (all channels, all connections of one identity) vs. the
     // separate, smaller hub-control quota. Both windows are enforced against
@@ -40,12 +39,13 @@ public sealed class ChatService
 
     private readonly object _lock = new();
     private readonly LobbyManager _lobbies;
+    private readonly RoomManager _rooms;
     private readonly TimeProvider _clock;
 
     private readonly Dictionary<long, IdentityState> _identities = new();
     private readonly Dictionary<string, long> _connections = new();
     private readonly Queue<ChatMessage> _globalHistory = new(MaxHistoryPerChannel);
-    private readonly Dictionary<Guid, ServerBacklog> _serverBacklogs = new();
+    private readonly Dictionary<Guid, RoomBacklog> _roomBacklogs = new();
 
     // Keyed by identity, retained across disconnects (contract: quota survives
     // a reconnect within its window). Separate tables so a message rejection
@@ -54,18 +54,18 @@ public sealed class ChatService
     private readonly Dictionary<long, Queue<long>> _controlAttempts = new();
 
     private long _sequence;
-    private long _historyAccess;
 
-    /// <summary>Held by callers around DB-backed rename/join transitions; sends never take it.</summary>
+    /// <summary>Serializes Room membership changes, Server Chat delivery, and rename transitions.</summary>
     internal SemaphoreSlim MembershipGate { get; } = new(1, 1);
 
     // Lock order: MembershipGate, then MembershipSync. Never await under this
-    // lock: lobby membership and chat recipient/backlog snapshots must agree.
+    // lock: Room membership and chat recipient/backlog snapshots must agree.
     internal object MembershipSync => _lock;
 
-    public ChatService(LobbyManager lobbies, TimeProvider clock)
+    public ChatService(LobbyManager lobbies, RoomManager rooms, TimeProvider clock)
     {
         _lobbies = lobbies;
+        _rooms = rooms;
         _clock = clock;
     }
 
@@ -229,27 +229,24 @@ public sealed class ChatService
         }
     }
 
-    internal ChatDelivery SendServer(string connectionId, Guid serverId, string text)
+    internal ChatDelivery SendServer(string connectionId, Guid roomId, string text)
     {
         lock (_lock)
         {
             var playerId = RequireConnected(connectionId);
             ConsumeMessageRate(playerId);
 
-            // Reject unauthorized targets before any routing/state mutation: the
-            // caller's live membership (never the RPC argument alone) decides scope.
-            if (_lobbies.GetServerId(connectionId) is not { } currentServerId || currentServerId != serverId)
-                throw new HubException("not_in_server");
+            // A caller-supplied Room ID never authorizes access by itself.
+            if (_rooms.GetRoomId(connectionId) is not { } currentRoomId || currentRoomId != roomId)
+                throw new HubException("not_in_room");
 
             var validText = ChatText.Message(text);
 
-            var backlog = GetOrCreateBacklog(serverId);
-            var message = NewMessage("server", serverId, null, playerId, validText);
-            backlog.LastActivity = ++_historyAccess;
+            var backlog = GetOrCreateBacklog(roomId);
+            var message = NewMessage("server", roomId, null, playerId, validText);
             Append(backlog.Messages, message);
 
-            var recipients = CollectServerRecipients(serverId);
-            return new ChatDelivery(message, recipients);
+            return new ChatDelivery(message, CollectRoomRecipients(roomId));
         }
     }
 
@@ -281,27 +278,32 @@ public sealed class ChatService
         }
     }
 
-    private ChatMessage NewMessage(string channel, Guid? serverId, string? recipientId, long senderId, string text)
+    private ChatMessage NewMessage(string channel, Guid? roomId, string? recipientId, long senderId, string text)
     {
         var sender = _identities[senderId].Profile;
-        return new ChatMessage(Guid.NewGuid(), ++_sequence, channel, serverId, recipientId, sender, text, _clock.GetUtcNow());
+        return new ChatMessage(Guid.NewGuid(), ++_sequence, channel, roomId, recipientId, sender, text, _clock.GetUtcNow());
     }
 
     private ServerChatState GetServerStateLocked(string connectionId)
     {
-        var serverId = _lobbies.GetServerId(connectionId);
-        if (serverId is null)
+        var roomId = _rooms.GetRoomId(connectionId);
+        if (roomId is null)
             return new ServerChatState(null, Array.Empty<ChatMessage>());
 
         ChatMessage[] messages;
-        if (_serverBacklogs.TryGetValue(serverId.Value, out var backlog))
+        if (_roomBacklogs.TryGetValue(roomId.Value, out var backlog))
         {
-            backlog.LastActivity = ++_historyAccess;
             messages = backlog.Messages.ToArray();
         }
         else
             messages = Array.Empty<ChatMessage>();
-        return new ServerChatState(serverId, messages);
+        return new ServerChatState(roomId, messages);
+    }
+
+    internal void ForgetRoom(Guid roomId)
+    {
+        lock (_lock)
+            _roomBacklogs.Remove(roomId);
     }
 
     private long RequireConnected(string connectionId)
@@ -375,63 +377,22 @@ public sealed class ChatService
             table.Remove(key);
     }
 
-    private ServerBacklog GetOrCreateBacklog(Guid serverId)
+    private RoomBacklog GetOrCreateBacklog(Guid roomId)
     {
-        if (_serverBacklogs.TryGetValue(serverId, out var existing))
+        if (_roomBacklogs.TryGetValue(roomId, out var existing))
             return existing;
 
-        if (_serverBacklogs.Count >= MaxServerBacklogs)
-            EvictIdleBacklog();
-
-        var backlog = new ServerBacklog();
-        _serverBacklogs[serverId] = backlog;
+        var backlog = new RoomBacklog();
+        _roomBacklogs.Add(roomId, backlog);
         return backlog;
     }
 
-    private void EvictIdleBacklog()
-    {
-        // ponytail: bounded scan over every online identity's connections
-        // (<=256*4=1024) to find which GameServers currently have a joined
-        // member. LobbyManager.GetServerId is a direct dictionary lookup with
-        // no allocation, so this stays cheap, and it only runs at the 256
-        // backlog cap. Active GameServers <= online identities, so a fresh
-        // ID never overflows the cap without at least one idle backlog to evict.
-        var active = new HashSet<Guid>();
-        foreach (var identity in _identities.Values)
-            foreach (var connectionId in identity.ConnectionIds)
-                if (_lobbies.GetServerId(connectionId) is { } activeServerId)
-                    active.Add(activeServerId);
-
-        Guid evictKey = default;
-        long oldest = 0;
-        var found = false;
-
-        foreach (var (key, backlog) in _serverBacklogs)
-        {
-            if (active.Contains(key))
-                continue;
-            if (found && backlog.LastActivity >= oldest)
-                continue;
-
-            found = true;
-            oldest = backlog.LastActivity;
-            evictKey = key;
-        }
-
-        if (!found)
-            throw new HubException("chat_capacity");
-
-        _serverBacklogs.Remove(evictKey);
-    }
-
-    // ponytail: same bounded connection scan as EvictIdleBacklog, reused to build
-    // the actual Server recipient list (connections currently joined to serverId).
-    private string[] CollectServerRecipients(Guid serverId)
+    private string[] CollectRoomRecipients(Guid roomId)
     {
         var recipients = new List<string>();
         foreach (var identity in _identities.Values)
             foreach (var connectionId in identity.ConnectionIds)
-                if (_lobbies.GetServerId(connectionId) == serverId)
+                if (_rooms.GetRoomId(connectionId) == roomId)
                     recipients.Add(connectionId);
         return recipients.ToArray();
     }
@@ -456,9 +417,8 @@ public sealed class ChatService
         public List<string> ConnectionIds { get; } = new(MaxConnectionsPerIdentity);
     }
 
-    private sealed class ServerBacklog
+    private sealed class RoomBacklog
     {
         public Queue<ChatMessage> Messages { get; } = new(MaxHistoryPerChannel);
-        public long LastActivity { get; set; }
     }
 }

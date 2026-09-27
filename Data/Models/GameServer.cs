@@ -20,5 +20,5 @@ public class GameServer
     public int CurrentMatches { get; set; }
     public string? CustomRulesJson { get; set; }
     public DateTime LastHeartbeat { get; set; } = DateTime.UtcNow;
-    public string ApiToken { get; set; } = string.Empty; // For auth
+    public string ApiTokenHash { get; set; } = string.Empty;
 }

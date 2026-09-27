@@ -32,6 +32,7 @@ public class AppDbContext : DbContext
             entity.HasIndex(e => e.Player2SteamId);
             entity.Property(e => e.ServerRegion).HasMaxLength(16).IsRequired();
             entity.HasIndex(e => e.ServerId);
+            entity.HasIndex(e => e.RoomId);
             entity.Property(e => e.CancelReason).HasMaxLength(32);
 
             // Foreign keys use Restrict on removal
@@ -64,7 +65,7 @@ public class AppDbContext : DbContext
             entity.Property(e => e.Name).HasMaxLength(128).IsRequired();
             entity.Property(e => e.IpAddress).HasMaxLength(45).IsRequired();
             entity.Property(e => e.Region).HasMaxLength(16).IsRequired();
-            entity.Property(e => e.ApiToken).HasMaxLength(128).IsRequired();
+            entity.Property(e => e.ApiTokenHash).HasMaxLength(64).IsRequired();
             entity.Property(e => e.SteamId).HasMaxLength(20);
             entity.Property(e => e.CatalogHash).HasMaxLength(64);
         });

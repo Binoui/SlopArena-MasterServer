@@ -476,26 +476,26 @@ public class LobbyManagerTests
     }
 
     [Fact]
-    public void JoinLobby_FullTarget_AdmitsServerChatAndSwitchesMembership()
+    public void JoinLobby_FullTarget_AdmitsGameServerAndSwitchesMembership()
     {
         var mgr = new LobbyManager();
         mgr.JoinLobby(ServerA, "c1", 101, "Alice");
         for (int i = 0; i < 4; i++)
             mgr.JoinLobby(ServerB, $"b{i}", 200 + i, $"B{i}");
 
-        // Waiting capacity is separate from authoritative Server Chat
-        // membership. A full target reports lobby_full but admits c1 to B.
+        // Waiting capacity is separate from physical GameServer membership.
+        // A full target reports lobby_full but still admits c1 to B.
         var result = mgr.JoinLobby(ServerB, "c1", 101, "Alice");
 
         Assert.False(result.Success);
-        Assert.True(result.ServerAdmitted);
+        Assert.True(result.GameServerAdmitted);
         Assert.Contains("full", result.Error, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(ServerB, mgr.GetServerId("c1"));
         Assert.Equal(ServerA, result.Departure!.ServerId);
     }
 
     [Fact]
-    public void DisconnectThenResumeServer_RestoresChatOnlyWithoutWaitingRoster()
+    public void DisconnectThenResumeServer_RestoresGameServerMembershipWithoutWaitingRoster()
     {
         var mgr = new LobbyManager();
         mgr.JoinLobby(ServerA, "c1", 101, "Alice");

@@ -75,7 +75,7 @@ public sealed class HttpMatchLauncher : IMatchLauncher
         var catalogAtStart = server.CatalogHash;
 
         var arena = config.ArenaName;
-        var matchGuid = Guid.NewGuid();
+        var matchGuid = config.MatchId == Guid.Empty ? Guid.NewGuid() : config.MatchId;
         var matchId = matchGuid.ToString();
         var players = config.Players;
 
@@ -111,6 +111,7 @@ public sealed class HttpMatchLauncher : IMatchLauncher
             Player3SteamId = players.Count > 2 ? players[2].SteamId : null,
             Player4SteamId = players.Count > 3 ? players[3].SteamId : null,
             ServerId = server.Id,
+            RoomId = config.RoomId,
             ServerRegion = server.Region,
             StartedAt = DateTime.UtcNow,
         });
@@ -137,8 +138,9 @@ public sealed class HttpMatchLauncher : IMatchLauncher
             body["virtualPort"] = 0;
             body["maxStocks"] = 3;
             body["catalogHash"] = catalogAtStart;
-            body["admissionExpiresAtUtc"] = admissionDeadline;
         }
+        if (_deployment.IsVps || config.RoomId is not null)
+            body["admissionExpiresAtUtc"] = admissionDeadline;
 
         var url = _deployment.IsVps
             ? _deployment.ControlUrl!
@@ -176,25 +178,29 @@ public sealed class HttpMatchLauncher : IMatchLauncher
                 var descriptor = new SteamMatchDescriptor("steam-p2p", result.ServerSteamId!,
                     matchGuid, 0, 2, result.ContentHash!, admissionDeadline);
                 _logger.LogInformation("Steam match {MatchId} launched on host {ServerId}", matchId, server.Id);
-                return new MatchLaunchResult(0, result.Content.Clone(), descriptor);
+                return new MatchLaunchResult(0, result.Content.Clone(), descriptor, matchGuid);
             }
+            if (config.RoomId is not null &&
+                (result.ContentHash != config.CatalogHash ||
+                 server.CatalogHash != config.CatalogHash))
+                throw new InvalidOperationException("GameHost returned content that differs from the Room's pinned catalog.");
             if (result.Port <= 0)
                 throw new InvalidOperationException("Development GameServer did not return a match port.");
-            return new MatchLaunchResult(result.Port, result.Content.Clone());
+            return new MatchLaunchResult(result.Port, result.Content.Clone(), MatchId: matchGuid);
         }
         catch
         {
-            if (_deployment.IsVps && launchSent)
+            if (launchSent)
             {
                 try
                 {
-                    using var abort = new HttpRequestMessage(HttpMethod.Post,
-                        new Uri(_deployment.ControlUrl!, "/match/abort"))
+                    using var abort = new HttpRequestMessage(HttpMethod.Post, new Uri(url, "/match/abort"))
                     {
                         Content = JsonContent.Create(new { matchId })
                     };
-                    abort.Headers.Authorization =
-                        new AuthenticationHeaderValue("Bearer", _deployment.MatchControlKey!);
+                    if (_deployment.IsVps)
+                        abort.Headers.Authorization =
+                            new AuthenticationHeaderValue("Bearer", _deployment.MatchControlKey!);
                     using var aborted = await _http.SendAsync(abort);
                     if (!aborted.IsSuccessStatusCode)
                         _logger.LogWarning("GameHost did not acknowledge abort for match {MatchId}.", matchId);

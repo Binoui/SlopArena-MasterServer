@@ -87,7 +87,7 @@ public class HttpMatchLauncherTests
             IpAddress = ip,
             Port = port,
             Region = "EU",
-            ApiToken = "tok",
+            ApiTokenHash = new string('0', 64),
             LastHeartbeat = DateTime.UtcNow,
             SteamId = steamId,
             ProtocolVersion = steamId is null ? 0 : 2,

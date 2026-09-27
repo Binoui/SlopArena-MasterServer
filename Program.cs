@@ -9,6 +9,7 @@ using MasterServer.Data;
 using MasterServer.DTOs;
 using MasterServer.Hubs;
 using MasterServer.Lobbies;
+using MasterServer.Rooms;
 using MasterServer.Steam;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
@@ -124,11 +125,18 @@ builder.Services.AddSingleton(_ =>
     return new LobbyOptions(max);
 });
 builder.Services.AddSingleton<LobbyManager>();
+// Public Rooms are independent of physical GameServer lobbies.
+builder.Services.AddSingleton<RoomManager>();
+builder.Services.AddSingleton<RoomDirectoryNotifier>();
+builder.Services.AddSingleton<MatchCompletionCoordinator>();
+builder.Services.AddHostedService<RoomCleanupService>();
 // Scoped: HttpMatchLauncher consumes the scoped AppDbContext to look up the
 // game server's IP + port before POSTing the match-start command (issue #35).
 // AddHttpClient gives the launcher a managed, pooled HttpClient (avoids socket
 // exhaustion from per-scope `new HttpClient()` — issue #35 review).
 builder.Services.AddHttpClient<IMatchLauncher, HttpMatchLauncher>();
+builder.Services.AddHttpClient("GameHostHealth")
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
 builder.Services.AddAuthorization();
 
 builder.Services.AddRateLimiter(options =>
@@ -253,6 +261,8 @@ static bool TimingSafeEquals(string a, string b)
 
 static string GenerateServerApiToken() =>
     Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+static string HashServerApiToken(string token) =>
+    Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
 
 // ── Helper: validate server address (IP literal or DNS hostname) ──
 static bool IsValidIpAddress(string ip)
@@ -380,6 +390,7 @@ app.MapPut("/auth/name", async (
     HttpContext context,
     AppDbContext db,
     ChatService chat,
+    RoomManager rooms,
     IHubContext<LobbyHub> hub) =>
 {
     if (!long.TryParse(context.User.FindFirst(ClaimTypes.NameIdentifier)?.Value,
@@ -397,6 +408,7 @@ app.MapPut("/auth/name", async (
     }
 
     ChatPlayer profile;
+    RoomMutationResult? roomChange;
     bool notify;
     await chat.MembershipGate.WaitAsync(context.RequestAborted);
     try
@@ -414,8 +426,15 @@ app.MapPut("/auth/name", async (
             user.Username = name;
             await db.SaveChangesAsync(context.RequestAborted);
         }
-        profile = chat.UpdateDisplayName(playerId, name);
-        notify = changed && chat.IsOnline(playerId);
+        lock (chat.MembershipSync)
+        {
+            profile = chat.UpdateDisplayName(playerId, name);
+            roomChange = rooms.RenameMember(playerId, name);
+            notify = changed && chat.IsOnline(playerId);
+        }
+        if (roomChange?.Snapshot is { } roomSnapshot)
+            await hub.Clients.Group($"room:{roomChange.RoomId}").SendAsync(
+                "RoomUpdated", roomSnapshot, context.RequestAborted);
     }
     finally
     {
@@ -500,47 +519,7 @@ GuestAuthResponse GenerateAuth(long steamId, string provider)
     return new GuestAuthResponse(new JwtSecurityTokenHandler().WriteToken(token), steamId, expiresAt);
 }
 
-// ponytail: one Master process serializes result/cancel races; use DB conditional updates if Master is replicated.
-var matchCompletionGate = new SemaphoreSlim(1, 1);
 
-async Task<int> CancelOpenMatchesAsync(AppDbContext db, IHubContext<LobbyHub> hub,
-    Guid serverId, string reason, Guid? matchId = null)
-{
-    await matchCompletionGate.WaitAsync();
-    try
-    {
-        var open = await db.Matches.Where(match => match.ServerId == serverId &&
-            match.EndedAt == null && match.CanceledAt == null &&
-            (matchId == null || match.Id == matchId)).ToListAsync();
-        if (open.Count == 0)
-            return 0;
-        foreach (var match in open)
-        {
-            match.CanceledAt = DateTime.UtcNow;
-            match.CancelReason = reason;
-            match.WinnerSteamId = null;
-        }
-        await db.SaveChangesAsync();
-        foreach (var match in open)
-        {
-            var roster = new[] { match.Player1SteamId, match.Player2SteamId }
-                .Concat(new[] { match.Player3SteamId, match.Player4SteamId }
-                    .Where(id => id.HasValue).Select(id => id!.Value))
-                .Select(id => id.ToString(CultureInfo.InvariantCulture)).ToArray();
-            try
-            {
-                await hub.Clients.Users(roster).SendAsync("MatchAborted",
-                    new { matchId = match.Id, reason });
-            }
-            catch (Exception)
-            {
-                logger.LogWarning("Could not notify match {MatchId} cancellation.", match.Id);
-            }
-        }
-        return open.Count;
-    }
-    finally { matchCompletionGate.Release(); }
-}
 
 // ── Game server registration endpoint ──
 app.MapPost("/servers/register", async (
@@ -548,7 +527,7 @@ app.MapPost("/servers/register", async (
     HttpContext httpContext,
     AppDbContext db,
     MasterDeploymentOptions deployment,
-    IHubContext<LobbyHub> hub) =>
+    MatchCompletionCoordinator completion) =>
 {
     if (deployment.IsVps)
     {
@@ -563,6 +542,9 @@ app.MapPost("/servers/register", async (
          request.InstanceId is null || request.InstanceId == Guid.Empty ||
          !IsCatalogHash(request.CatalogHash)))
         return Results.BadRequest(new { error = "Current Steam identity, process instance, catalog hash and protocol 2 are required." });
+    if (!deployment.IsVps && request.CatalogHash is not null &&
+        !IsCatalogHash(request.CatalogHash))
+        return Results.BadRequest(new { error = "Invalid development catalog hash." });
 
     if (string.IsNullOrWhiteSpace(request.Name))
         return Results.BadRequest(new { error = "Name is required" });
@@ -591,6 +573,20 @@ app.MapPost("/servers/register", async (
 
     async Task<IResult> Refresh(MasterServer.Data.Models.GameServer target)
     {
+        if (deployment.IsVps)
+        {
+            if (target.SteamId != request.SteamId || target.InstanceId != request.InstanceId)
+            {
+                await completion.CancelOpenMatchesUnderGateAsync(db, target.Id, "host_restart");
+                target.CurrentMatches = 0;
+            }
+        }
+        else
+        {
+            await completion.CancelOpenMatchesUnderGateAsync(db, target.Id, "host_restart");
+            target.CurrentMatches = 0;
+        }
+
         target.Name = request.Name;
         target.IpAddress = ipAddress;
         target.Port = port;
@@ -598,23 +594,13 @@ app.MapPost("/servers/register", async (
         target.IsOfficial = isOfficial;
         target.MaxConcurrentMatches = request.MaxConcurrentMatches;
         target.CustomRulesJson = request.CustomRulesJson;
-        if (deployment.IsVps && (target.SteamId != request.SteamId ||
-            target.InstanceId != request.InstanceId))
-        {
-            await CancelOpenMatchesAsync(db, hub, target.Id, "host_restart");
-            target.ApiToken = GenerateServerApiToken();
-            target.CurrentMatches = 0;
-        }
         target.SteamId = deployment.IsVps ? request.SteamId : null;
         target.ProtocolVersion = deployment.IsVps ? request.ProtocolVersion : 0;
         target.InstanceId = deployment.IsVps ? request.InstanceId : null;
-        target.CatalogHash = deployment.IsVps ? request.CatalogHash : null;
-        if (!deployment.IsVps)
-        {
-            target.CurrentMatches = 0;
-            target.ApiToken = GenerateServerApiToken();
-        }
+        target.CatalogHash = request.CatalogHash;
         target.LastHeartbeat = DateTime.UtcNow;
+        var apiToken = GenerateServerApiToken();
+        target.ApiTokenHash = HashServerApiToken(apiToken);
 
         await db.SaveChangesAsync();
 
@@ -622,60 +608,64 @@ app.MapPost("/servers/register", async (
             "Game server re-registered: {Name} (ID: {Id}, Region: {Region})",
             target.Name, target.Id, target.Region);
 
-        return Results.Ok(new { serverId = target.Id, apiToken = target.ApiToken });
+        return Results.Ok(new { serverId = target.Id, apiToken });
     }
 
-    // VPS identity is the provisioned primary key, never a request address.
-    // Development keeps its explicit legacy ip:port upsert.
-    var existing = deployment.IsVps
-        ? await db.GameServers.FindAsync(serverId)
-        : await db.GameServers.FirstOrDefaultAsync(s => s.IpAddress == ipAddress && s.Port == port);
-    if (existing is not null)
-        return await Refresh(existing);
-
-    var gameServer = new MasterServer.Data.Models.GameServer
+    return await completion.RunExclusiveAsync<IResult>(async () =>
     {
-        Id = serverId,
-        Name = request.Name,
-        IpAddress = ipAddress,
-        Port = port,
-        SteamId = deployment.IsVps ? request.SteamId : null,
-        ProtocolVersion = deployment.IsVps ? request.ProtocolVersion : 0,
-        InstanceId = deployment.IsVps ? request.InstanceId : null,
-        CatalogHash = deployment.IsVps ? request.CatalogHash : null,
-        Region = request.Region,
-        IsOfficial = isOfficial,
-        MaxConcurrentMatches = request.MaxConcurrentMatches,
-        CurrentMatches = 0,
-        CustomRulesJson = request.CustomRulesJson,
-        ApiToken = GenerateServerApiToken(),
-        LastHeartbeat = DateTime.UtcNow
-    };
-
-    db.GameServers.Add(gameServer);
-
-    try
-    {
-        await db.SaveChangesAsync();
-    }
-    catch (DbUpdateException)
-    {
-        // The primary key arbitrates concurrent VPS inserts; ip:port does so in
-        // development. Re-read the winner and return its stable API token.
-        db.Entry(gameServer).State = EntityState.Detached;
-        var winner = deployment.IsVps
+        // VPS identity is the provisioned primary key, never a request address.
+        // Development keeps its explicit legacy ip:port upsert.
+        var existing = deployment.IsVps
             ? await db.GameServers.FindAsync(serverId)
             : await db.GameServers.FirstOrDefaultAsync(s => s.IpAddress == ipAddress && s.Port == port);
-        if (winner is null)
-            throw;
-        return await Refresh(winner);
-    }
+        if (existing is not null)
+            return await Refresh(existing);
 
-    logger.LogInformation(
-        "Game server registered: {Name} (ID: {Id}, Region: {Region})",
-        gameServer.Name, gameServer.Id, gameServer.Region);
+        var newApiToken = GenerateServerApiToken();
+        var gameServer = new MasterServer.Data.Models.GameServer
+        {
+            Id = serverId,
+            Name = request.Name,
+            IpAddress = ipAddress,
+            Port = port,
+            SteamId = deployment.IsVps ? request.SteamId : null,
+            ProtocolVersion = deployment.IsVps ? request.ProtocolVersion : 0,
+            InstanceId = deployment.IsVps ? request.InstanceId : null,
+            CatalogHash = request.CatalogHash,
+            Region = request.Region,
+            IsOfficial = isOfficial,
+            MaxConcurrentMatches = request.MaxConcurrentMatches,
+            CurrentMatches = 0,
+            CustomRulesJson = request.CustomRulesJson,
+            ApiTokenHash = HashServerApiToken(newApiToken),
+            LastHeartbeat = DateTime.UtcNow
+        };
 
-    return Results.Ok(new { serverId = gameServer.Id, apiToken = gameServer.ApiToken });
+        db.GameServers.Add(gameServer);
+
+        try
+        {
+            await db.SaveChangesAsync();
+        }
+        catch (DbUpdateException)
+        {
+            // The primary key arbitrates concurrent VPS inserts; ip:port does so in
+            // development. Re-read the winner and issue a fresh API token.
+            db.Entry(gameServer).State = EntityState.Detached;
+            var winner = deployment.IsVps
+                ? await db.GameServers.FindAsync(serverId)
+                : await db.GameServers.FirstOrDefaultAsync(s => s.IpAddress == ipAddress && s.Port == port);
+            if (winner is null)
+                throw;
+            return await Refresh(winner);
+        }
+
+        logger.LogInformation(
+            "Game server registered: {Name} (ID: {Id}, Region: {Region})",
+            gameServer.Name, gameServer.Id, gameServer.Region);
+
+        return Results.Ok(new { serverId = gameServer.Id, apiToken = newApiToken });
+    }, httpContext.RequestAborted);
 });
 
 // ── Server heartbeat endpoint ──
@@ -684,41 +674,50 @@ app.MapPost("/servers/{serverId}/heartbeat", async (
     HeartbeatRequest request,
     HttpContext httpContext,
     AppDbContext db,
-    MasterDeploymentOptions deployment) =>
+    MasterDeploymentOptions deployment,
+    MatchCompletionCoordinator completion) =>
 {
     var token = ExtractBearerToken(httpContext, logger);
     if (token == null)
         return Results.Unauthorized();
 
-    var server = await db.GameServers.FindAsync(serverId);
-    if (server == null)
+    return await completion.RunExclusiveAsync<IResult>(async () =>
     {
-        logger.LogWarning("Heartbeat from unknown server: {ServerId}", serverId);
-        return Results.NotFound(new { error = "Server not found" });
-    }
+        var server = await db.GameServers.FindAsync(serverId);
+        if (server == null)
+        {
+            logger.LogWarning("Heartbeat from unknown server: {ServerId}", serverId);
+            return Results.NotFound(new { error = "Server not found" });
+        }
 
-    if ((deployment.IsVps && server.Id != deployment.ApprovedHostId) ||
-        !TimingSafeEquals(server.ApiToken, token))
-    {
-        logger.LogWarning("Heartbeat auth failed for server {ServerId}", serverId);
-        return Results.Unauthorized();
-    }
-    if (deployment.IsVps && (server.SteamId != request.SteamId ||
-        server.InstanceId != request.InstanceId || server.ProtocolVersion != 2 ||
-        server.CatalogHash != request.CatalogHash))
-    {
-        // Stop advertising the superseded identity immediately; an authenticated
-        // re-registration must pin the new identity/catalog before another launch.
-        server.LastHeartbeat = DateTime.UtcNow.AddMinutes(-1);
+        if ((deployment.IsVps && server.Id != deployment.ApprovedHostId) ||
+            !TimingSafeEquals(server.ApiTokenHash, HashServerApiToken(token)))
+        {
+            logger.LogWarning("Heartbeat auth failed for server {ServerId}", serverId);
+            return Results.Unauthorized();
+        }
+        if (deployment.IsVps && (server.SteamId != request.SteamId ||
+            server.InstanceId != request.InstanceId || server.ProtocolVersion != 2 ||
+            server.CatalogHash != request.CatalogHash))
+        {
+            // Stop advertising the superseded identity immediately; an authenticated
+            // re-registration must pin the new identity/catalog before another launch.
+            server.LastHeartbeat = DateTime.UtcNow.AddMinutes(-1);
+            await db.SaveChangesAsync();
+            return Results.Conflict(new { error = "host_identity_changed" });
+        }
+        if (!deployment.IsVps && request.CatalogHash is not null &&
+            !IsCatalogHash(request.CatalogHash))
+            return Results.BadRequest(new { error = "Invalid development catalog hash." });
+
+        server.CurrentMatches = request.CurrentMatches;
+        if (!deployment.IsVps)
+            server.CatalogHash = request.CatalogHash;
+        server.LastHeartbeat = DateTime.UtcNow;
         await db.SaveChangesAsync();
-        return Results.Conflict(new { error = "host_identity_changed" });
-    }
 
-    server.CurrentMatches = request.CurrentMatches;
-    server.LastHeartbeat = DateTime.UtcNow;
-    await db.SaveChangesAsync();
-
-    return Results.Ok(new { status = "ok" });
+        return Results.Ok(new { status = "ok" });
+    }, httpContext.RequestAborted);
 });
 
 // ── Server deregister endpoint (issue #49) ──
@@ -730,47 +729,45 @@ app.MapDelete("/servers/{serverId}", async (
     HttpContext httpContext,
     AppDbContext db,
     MasterDeploymentOptions deployment,
-    IHubContext<LobbyHub> hub) =>
+    MatchCompletionCoordinator completion) =>
 {
     var token = ExtractBearerToken(httpContext, logger);
     if (token == null)
         return Results.Unauthorized();
 
-    var server = await db.GameServers.FindAsync(serverId);
-    if (server == null)
+    return await completion.RunExclusiveAsync<IResult>(async () =>
     {
-        logger.LogWarning("Deregister from unknown server: {ServerId}", serverId);
-        return Results.NotFound(new { error = "Server not found" });
-    }
+        var server = await db.GameServers.FindAsync(serverId);
+        if (server == null)
+        {
+            logger.LogWarning("Deregister from unknown server: {ServerId}", serverId);
+            return Results.NotFound(new { error = "Server not found" });
+        }
 
-    if ((deployment.IsVps && server.Id != deployment.ApprovedHostId) ||
-        !TimingSafeEquals(server.ApiToken, token))
-    {
-        logger.LogWarning("Deregister auth failed for server {ServerId}", serverId);
-        return Results.Unauthorized();
-    }
+        if ((deployment.IsVps && server.Id != deployment.ApprovedHostId) ||
+            !TimingSafeEquals(server.ApiTokenHash, HashServerApiToken(token)))
+        {
+            logger.LogWarning("Deregister auth failed for server {ServerId}", serverId);
+            return Results.Unauthorized();
+        }
 
-    if (deployment.IsVps)
-        await CancelOpenMatchesAsync(db, hub, server.Id, "host_shutdown");
-    db.GameServers.Remove(server);
-    await db.SaveChangesAsync();
+        await completion.CancelOpenMatchesUnderGateAsync(db, server.Id, "host_shutdown");
+        db.GameServers.Remove(server);
+        await db.SaveChangesAsync();
 
-    logger.LogInformation("Game server deregistered: {Name} (ID: {ServerId})", server.Name, server.Id);
-    return Results.Ok(new { status = "deregistered" });
+        logger.LogInformation("Game server deregistered: {Name} (ID: {ServerId})", server.Name, server.Id);
+        return Results.Ok(new { status = "deregistered" });
+    }, httpContext.RequestAborted);
 });
 
 // ── Server browser list endpoint (issue #31) ──
 app.MapGet("/servers", async (AppDbContext db, MasterDeploymentOptions deployment) =>
 {
+    if (deployment.IsVps)
+        return Results.NotFound();
     var cutoff = DateTime.UtcNow.AddSeconds(-15);
     var eligible = db.GameServers
         .Where(s => s.LastHeartbeat > cutoff && s.CurrentMatches < s.MaxConcurrentMatches);
-    if (deployment.IsVps)
-    {
-        var approvedId = deployment.ApprovedHostId!.Value;
-        eligible = eligible.Where(s => s.Id == approvedId &&
-            s.SteamId != null && s.InstanceId != null && s.ProtocolVersion == 2);
-    }
     var servers = await eligible
         .OrderByDescending(s => s.IsOfficial)
         .ThenBy(s => s.Name)
@@ -797,28 +794,29 @@ app.MapPost("/match/result", async (
     MatchResultRequest request,
     HttpContext httpContext,
     AppDbContext db,
-    MasterDeploymentOptions deployment) =>
+    MasterDeploymentOptions deployment,
+    MatchCompletionCoordinator completion) =>
 {
     var token = ExtractBearerToken(httpContext, logger);
     if (token == null)
         return Results.Unauthorized();
 
-    // Verify server token (find server with this token)
-    var server = await db.GameServers.FirstOrDefaultAsync(s => s.ApiToken == token);
-    if (server == null || (deployment.IsVps && server.Id != deployment.ApprovedHostId) ||
-        !TimingSafeEquals(server.ApiToken, token))
+    // Look up only the digest; a leaked database cannot supply a bearer token.
+    var tokenHash = HashServerApiToken(token);
+    return await completion.RunExclusiveAsync<IResult>(async () =>
     {
-        logger.LogWarning("Match result auth failed");
-        return Results.Unauthorized();
-    }
+        var server = await db.GameServers.FirstOrDefaultAsync(s => s.ApiTokenHash == tokenHash);
+        if (server == null || (deployment.IsVps && server.Id != deployment.ApprovedHostId) ||
+            !TimingSafeEquals(server.ApiTokenHash, tokenHash))
+        {
+            logger.LogWarning("Match result auth failed");
+            return Results.Unauthorized();
+        }
 
-    await matchCompletionGate.WaitAsync(httpContext.RequestAborted);
-    try
-    {
         var match = await db.Matches.FindAsync(request.MatchId);
         if (match is null)
             return Results.NotFound(new { error = "Match not found" });
-        if (deployment.IsVps && match.ServerId != server.Id)
+        if (match.ServerId != server.Id)
             return Results.Unauthorized();
         if (match.CanceledAt is not null)
             return Results.Conflict(new { error = "match_canceled" });
@@ -835,43 +833,46 @@ app.MapPost("/match/result", async (
         match.EndedAt = DateTime.UtcNow;
         server.CurrentMatches = Math.Max(0, server.CurrentMatches - 1);
         await db.SaveChangesAsync(httpContext.RequestAborted);
+        await completion.PublishRoomTerminalUpdateAsync(match.RoomId, match.Id);
         return Results.Ok(new { status = "recorded", mmrChange = 0 });
-    }
-    finally { matchCompletionGate.Release(); }
+    }, httpContext.RequestAborted);
 });
 
 app.MapPost("/match/cancel", async (MatchCancelRequest request, HttpContext context,
-    AppDbContext db, IHubContext<LobbyHub> hub, MasterDeploymentOptions deployment) =>
+    AppDbContext db, MasterDeploymentOptions deployment,
+    MatchCompletionCoordinator completion) =>
 {
     var token = ExtractBearerToken(context, logger);
     if (token is null) return Results.Unauthorized();
-    var server = await db.GameServers.FirstOrDefaultAsync(s => s.ApiToken == token);
-    if (server is null || (deployment.IsVps && server.Id != deployment.ApprovedHostId) ||
-        !TimingSafeEquals(server.ApiToken, token))
-        return Results.Unauthorized();
-    if (request.MatchId == Guid.Empty || request.Reason is not
-        ("unfilled" or "absent" or "host_restart" or "host_shutdown" or "content_unavailable"))
-        return Results.BadRequest(new { error = "invalid_cancellation" });
-    var match = await db.Matches.FindAsync(request.MatchId);
-    if (match is null)
-        return Results.NotFound();
-    if (match.ServerId != server.Id)
-        return Results.Unauthorized();
-    if (match.EndedAt is not null)
-        return Results.Conflict(new { error = "match_completed" });
-    var count = await CancelOpenMatchesAsync(db, hub, server.Id, request.Reason, request.MatchId);
-    if (count > 0)
+    var tokenHash = HashServerApiToken(token);
+
+    return await completion.RunExclusiveAsync<IResult>(async () =>
     {
-        server.CurrentMatches = Math.Max(0, server.CurrentMatches - 1);
-        await db.SaveChangesAsync();
-    }
-    else
-    {
-        await db.Entry(match).ReloadAsync();
+        var server = await db.GameServers.FirstOrDefaultAsync(s => s.ApiTokenHash == tokenHash);
+        if (server is null || (deployment.IsVps && server.Id != deployment.ApprovedHostId) ||
+            !TimingSafeEquals(server.ApiTokenHash, tokenHash))
+            return Results.Unauthorized();
+        if (request.MatchId == Guid.Empty || request.Reason is not
+            ("unfilled" or "absent" or "host_restart" or "host_shutdown" or "content_unavailable"))
+            return Results.BadRequest(new { error = "invalid_cancellation" });
+        var match = await db.Matches.FindAsync(request.MatchId);
+        if (match is null)
+            return Results.NotFound();
+        if (match.ServerId != server.Id)
+            return Results.Unauthorized();
         if (match.EndedAt is not null)
             return Results.Conflict(new { error = "match_completed" });
-    }
-    return Results.Ok(new { status = "canceled" });
+
+        var count = await completion.CancelOpenMatchesUnderGateAsync(
+            db, server.Id, request.Reason, request.MatchId);
+        if (count == 0)
+        {
+            await db.Entry(match).ReloadAsync();
+            if (match.EndedAt is not null)
+                return Results.Conflict(new { error = "match_completed" });
+        }
+        return Results.Ok(new { status = "canceled" });
+    }, context.RequestAborted);
 });
 
 // ── SignalR lobby hub (issue #32) ──

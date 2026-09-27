@@ -11,6 +11,7 @@ public class Match
     public long? WinnerSteamId { get; set; } // Null for draws or disconnects
     public string ServerRegion { get; set; } = string.Empty;
     public Guid? ServerId { get; set; }
+    public Guid? RoomId { get; set; }
     public DateTime? CanceledAt { get; set; }
     public string? CancelReason { get; set; }
     public DateTime StartedAt { get; set; } = DateTime.UtcNow;

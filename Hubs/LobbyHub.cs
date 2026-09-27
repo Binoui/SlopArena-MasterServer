@@ -5,6 +5,7 @@ using MasterServer.Chat;
 using MasterServer.Configuration;
 using MasterServer.Data;
 using MasterServer.Lobbies;
+using MasterServer.Rooms;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
@@ -12,29 +13,38 @@ using Microsoft.EntityFrameworkCore;
 namespace MasterServer.Hubs;
 
 /// <summary>
-/// Authenticated game-wide chat and per-GameServer lobby control. LobbyManager
-/// owns waiting-roster and authoritative GameServer membership; ChatService owns
+/// Authenticated game-wide chat, public Rooms, and per-GameServer lobby control.
+/// LobbyManager owns waiting-roster and authoritative GameServer membership;
+/// RoomManager owns independent public Room membership; ChatService owns
 /// presence, message budgets, history, and recipient snapshots.
 /// </summary>
 [Authorize]
 public sealed class LobbyHub : Hub
 {
     private readonly LobbyManager _lobbies;
+    private readonly RoomManager _rooms;
     private readonly AppDbContext _db;
     private readonly IMatchLauncher _launcher;
     private readonly ILogger<LobbyHub> _logger;
     private readonly ChatService _chat;
     private readonly MasterDeploymentOptions _deployment;
+    private readonly RoomDirectoryNotifier _directory;
+    // One Master process serializes host selection with launch; the persisted open rows
+    // arbitrate capacity after each release. A replicated Master needs DB reservation.
+    private static readonly SemaphoreSlim RoomLaunchGate = new(1, 1);
 
     public LobbyHub(LobbyManager lobbies, AppDbContext db, IMatchLauncher launcher,
-        ILogger<LobbyHub> logger, ChatService chat, MasterDeploymentOptions deployment)
+        ILogger<LobbyHub> logger, ChatService chat, MasterDeploymentOptions deployment, RoomManager rooms,
+        RoomDirectoryNotifier directory)
     {
         _lobbies = lobbies;
+        _rooms = rooms;
         _db = db;
         _launcher = launcher;
         _logger = logger;
         _chat = chat;
         _deployment = deployment;
+        _directory = directory;
     }
 
     public override async Task OnConnectedAsync()
@@ -42,31 +52,54 @@ public sealed class LobbyHub : Hub
         if (!TryGetSteamId(out var playerId))
             throw new HubException("Authenticated identity missing.");
 
-        ChatPresence? presence;
+        ChatPresence? presence = null;
+        RoomConnectionResult? room = null;
+        ServerChatState roomChat;
         await _chat.MembershipGate.WaitAsync(Context.ConnectionAborted);
         try
         {
             var user = await _db.Users.FindAsync(playerId);
             if (user is null)
                 throw new HubException("Authenticated user not found.");
-            presence = _chat.Connect(playerId, user.Username, Context.ConnectionId);
+
+            lock (_chat.MembershipSync)
+            {
+                presence = _chat.Connect(playerId, user.Username, Context.ConnectionId);
+                room = _rooms.Connect(playerId, Context.ConnectionId);
+                roomChat = _chat.GetServerState(Context.ConnectionId);
+            }
+
+            await base.OnConnectedAsync();
+            if (room?.Snapshot is { } snapshot)
+                await Groups.AddToGroupAsync(Context.ConnectionId, RoomGroupName(snapshot.Id));
+            if (room?.Change is { } change)
+            {
+                await RevokeRoomConnectionsAsync(change);
+                await RemoveRoomConnectionsAsync(change);
+                if (change.Snapshot is { MemberCount: > 0 })
+                    await Clients.Group(RoomGroupName(change.RoomId))
+                        .SendAsync("RoomUpdated", change.Snapshot);
+                if (change.Changed)
+                    await _directory.NotifyChangedAsync(Context.ConnectionAborted);
+            }
+            await Clients.Caller.SendAsync("ChatServerChanged", roomChat, Context.ConnectionAborted);
+        }
+        catch
+        {
+            lock (_chat.MembershipSync)
+            {
+                _rooms.Disconnect(Context.ConnectionId);
+                _chat.Disconnect(Context.ConnectionId);
+            }
+            throw;
         }
         finally
         {
             _chat.MembershipGate.Release();
         }
 
-        try
-        {
-            await base.OnConnectedAsync();
-            if (presence is not null)
-                await Clients.All.SendAsync("ChatPresenceChanged", presence);
-        }
-        catch
-        {
-            _chat.Disconnect(Context.ConnectionId);
-            throw;
-        }
+        if (presence is not null)
+            await Clients.All.SendAsync("ChatPresenceChanged", presence);
     }
 
     public ChatSnapshot GetChatState() => _chat.GetSnapshot(Context.ConnectionId);
@@ -76,8 +109,20 @@ public sealed class LobbyHub : Hub
     public Task<ChatMessage> SendGlobal(string text)
         => Deliver(_chat.SendGlobal(Context.ConnectionId, text));
 
-    public Task<ChatMessage> SendServer(Guid serverId, string text)
-        => Deliver(_chat.SendServer(Context.ConnectionId, serverId, text));
+    public async Task<ChatMessage> SendServer(Guid roomId, string text)
+    {
+        await _chat.MembershipGate.WaitAsync(Context.ConnectionAborted);
+        try
+        {
+            var delivery = _chat.SendServer(Context.ConnectionId, roomId, text);
+            await Deliver(delivery);
+            return delivery.Message;
+        }
+        finally
+        {
+            _chat.MembershipGate.Release();
+        }
+    }
 
     public Task<ChatMessage> SendDirect(string playerId, string text)
         => Deliver(_chat.SendDirect(Context.ConnectionId, playerId, text));
@@ -89,20 +134,15 @@ public sealed class LobbyHub : Hub
         return delivery.Message;
     }
 
-    /// <summary>
-    /// Explicitly enters a GameServer's waiting room. A full waiting roster
-    /// still admits authoritative Server Chat membership; the invocation then
-    /// fails with <c>lobby_full</c> after the caller receives ChatServerChanged.
-    /// </summary>
+    /// <summary>Development-only legacy GameServer waiting-roster admission.</summary>
     public async Task JoinLobby(Guid serverId, int protocolVersion)
     {
         if (!TryGetSteamId(out var playerId))
             throw new HubException("Authenticated identity missing.");
-        if (_deployment.IsVps && protocolVersion != 2)
-            throw new HubException("incompatible_protocol");
+        if (_deployment.IsVps)
+            throw new HubException("physical_admission_disabled: Join a Room instead.");
 
         JoinLobbyResult result;
-        ServerChatState serverChat;
         await _chat.MembershipGate.WaitAsync(Context.ConnectionAborted);
         try
         {
@@ -110,6 +150,8 @@ public sealed class LobbyHub : Hub
                 throw new HubException("server_unavailable");
             if (_chat.HasOtherLobbyConnection(playerId, Context.ConnectionId))
                 throw new HubException("already_joined");
+            if (_rooms.GetMyRoom(playerId) is not null)
+                throw new HubException("already_in_room: Leave your Room before joining a GameServer lobby.");
 
             var user = await _db.Users.FindAsync(playerId);
             if (user is null)
@@ -118,9 +160,8 @@ public sealed class LobbyHub : Hub
             lock (_chat.MembershipSync)
             {
                 result = _lobbies.JoinLobby(serverId, Context.ConnectionId, playerId, user.Username);
-                if (!result.ServerAdmitted)
+                if (!result.GameServerAdmitted)
                     throw new HubException(result.Error ?? "Join rejected.");
-                serverChat = _chat.GetServerState(Context.ConnectionId);
             }
         }
         finally
@@ -140,26 +181,21 @@ public sealed class LobbyHub : Hub
         }
         else
         {
-            _logger.LogInformation("Server {ServerId}: player {PlayerId} admitted to chat; waiting roster full", serverId, playerId);
+            _logger.LogInformation("Server {ServerId}: player {PlayerId} joined; waiting roster full", serverId, playerId);
         }
 
-        await Clients.Caller.SendAsync("ChatServerChanged", serverChat);
         if (!result.Success)
             throw new HubException("lobby_full");
     }
 
-    /// <summary>
-    /// Revalidates and restores a remembered active-match GameServer
-    /// membership after reconnect. This never enters the waiting roster.
-    /// </summary>
+    /// <summary>Development-only reconnect for remembered GameServer admission.</summary>
     public async Task ResumeServer(Guid serverId, int protocolVersion)
     {
         if (!TryGetSteamId(out var playerId))
             throw new HubException("Authenticated identity missing.");
-        if (_deployment.IsVps && protocolVersion != 2)
-            throw new HubException("incompatible_protocol");
+        if (_deployment.IsVps)
+            throw new HubException("physical_admission_disabled: Join a Room instead.");
 
-        ServerChatState serverChat;
         await _chat.MembershipGate.WaitAsync(Context.ConnectionAborted);
         try
         {
@@ -167,6 +203,8 @@ public sealed class LobbyHub : Hub
                 throw new HubException("server_unavailable");
             if (_chat.HasOtherLobbyConnection(playerId, Context.ConnectionId))
                 throw new HubException("already_joined");
+            if (_rooms.GetMyRoom(playerId) is not null)
+                throw new HubException("already_in_room: Leave your Room before resuming a GameServer lobby.");
 
             var user = await _db.Users.FindAsync(playerId);
             if (user is null)
@@ -176,7 +214,6 @@ public sealed class LobbyHub : Hub
             {
                 if (!_lobbies.ResumeServer(serverId, Context.ConnectionId, playerId, user.Username, out var error))
                     throw new HubException(error ?? "not_admitted");
-                serverChat = _chat.GetServerState(Context.ConnectionId);
             }
         }
         finally
@@ -184,10 +221,289 @@ public sealed class LobbyHub : Hub
             _chat.MembershipGate.Release();
         }
 
-        await Clients.Caller.SendAsync("ChatServerChanged", serverChat);
     }
 
-    /// <summary>Explicitly leaves the current GameServer and its chat channel.</summary>
+    public RoomSummary[] GetRooms() => _rooms.GetRooms();
+
+    public RoomSnapshot? GetMyRoom()
+    {
+        if (!TryGetSteamId(out var playerId))
+            throw new HubException("Authenticated identity missing.");
+        return _rooms.GetMyRoom(playerId);
+    }
+    public Task<RoomSnapshot> RoomStartCharacterSelect()
+        => ApplyRoomPreparationAsync(_rooms.StartCharacterSelect, directoryChanged: true);
+
+    public Task<RoomSnapshot> RoomSelectCharacter(string character)
+        => ApplyRoomPreparationAsync(playerId => _rooms.SelectCharacter(playerId, character));
+
+    public Task<RoomSnapshot> RoomStartStageSelect()
+        => ApplyRoomPreparationAsync(_rooms.StartStageSelect, directoryChanged: true);
+
+    public Task<RoomSnapshot> RoomChooseArena(string arena)
+        => ApplyRoomPreparationAsync(playerId => _rooms.ChooseArena(playerId, arena));
+
+    private async Task<RoomSnapshot> ApplyRoomPreparationAsync(
+        Func<long, RoomMutationResult> mutate, bool directoryChanged = false)
+    {
+        if (!TryGetSteamId(out var playerId))
+            throw new HubException("Authenticated identity missing.");
+        await _chat.MembershipGate.WaitAsync(Context.ConnectionAborted);
+        try
+        {
+            RoomMutationResult result;
+            lock (_chat.MembershipSync)
+                result = mutate(playerId);
+            if (result.Error is not null)
+                throw new HubException(result.Error);
+            await Clients.Group(RoomGroupName(result.RoomId))
+                .SendAsync("RoomUpdated", result.Snapshot!, Context.ConnectionAborted);
+            if (directoryChanged && result.Changed)
+                await _directory.NotifyChangedAsync(Context.ConnectionAborted);
+            return result.Snapshot!;
+        }
+        finally
+        {
+            _chat.MembershipGate.Release();
+        }
+    }
+
+
+    public async Task<MatchStartedConfig> RoomStartMatch()
+    {
+        await _rooms.MatchLifecycleGate.WaitAsync(Context.ConnectionAborted);
+        try
+        {
+            return await StartRoomMatchCoreAsync();
+        }
+        finally
+        {
+            _rooms.MatchLifecycleGate.Release();
+        }
+    }
+
+    private async Task<MatchStartedConfig> StartRoomMatchCoreAsync()
+    {
+        if (!TryGetSteamId(out var playerId))
+            throw new HubException("Authenticated identity missing.");
+        var preparation = _rooms.BeginMatch(playerId, out var error);
+        if (preparation is null)
+            throw new HubException(error ?? "room_not_ready: Finish Room preparation first.");
+
+        var roomId = preparation.RoomId;
+        var matchId = preparation.MatchId;
+        MatchStartedConfig? started = null;
+        try
+        {
+            await Clients.Group(RoomGroupName(roomId)).SendAsync("RoomUpdated", _rooms.GetMyRoom(playerId)!);
+            await _directory.NotifyChangedAsync(Context.ConnectionAborted);
+            await RoomLaunchGate.WaitAsync();
+            try
+            {
+                var server = await ChooseRoomHostAsync();
+                if (server is null)
+                    throw new HubException("gamehost_unavailable: No fresh compatible GameHost has a free Match slot. Retry later.");
+                var config = new MatchStartedConfig(server.Id, preparation.Players,
+                    ArenaName: preparation.ArenaName, RoomId: roomId, MatchId: matchId,
+                    CatalogHash: _rooms.CatalogHash,
+                    ServerAddress: _deployment.IsVps ? null : server.IpAddress);
+                var launch = await _launcher.LaunchAsync(config);
+                if (launch.MatchId != matchId ||
+                    launch.Descriptor is { } descriptor && descriptor.MatchId != matchId)
+                    throw new InvalidOperationException("GameHost returned a different Match identity.");
+                started = config with
+                {
+                    MatchPort = launch.MatchPort,
+                    Content = launch.Content,
+                    Descriptor = launch.Descriptor,
+                    MatchId = launch.MatchId
+                };
+                if (_rooms.CompleteLaunch(roomId, matchId) is null)
+                    throw new InvalidOperationException("Room launch identity changed during GameHost admission.");
+            }
+            finally
+            {
+                RoomLaunchGate.Release();
+            }
+        }
+        catch (Exception exception)
+        {
+            var restored = _rooms.FailLaunch(roomId, matchId);
+            if (restored is not null)
+            {
+                await Clients.Group(RoomGroupName(roomId)).SendAsync("RoomUpdated", restored);
+                await _directory.NotifyChangedAsync(Context.ConnectionAborted);
+            }
+            if (exception is HubException) throw;
+            _logger.LogWarning(exception, "Room {RoomId} could not launch Match {MatchId}", roomId, matchId);
+            throw new HubException("gamehost_start_failed: GameHost could not start this Match. Room selections are intact; retry.");
+        }
+
+        var inMatch = _rooms.GetMyRoom(playerId);
+        if (inMatch is not null)
+        {
+            await Clients.Group(RoomGroupName(roomId)).SendAsync("RoomUpdated", inMatch);
+            await _directory.NotifyChangedAsync(Context.ConnectionAborted);
+        }
+        await Clients.Group(RoomGroupName(roomId)).SendAsync("MatchStarted", started!);
+        return started!;
+    }
+
+    private async Task<MasterServer.Data.Models.GameServer?> ChooseRoomHostAsync()
+    {
+        var cutoff = DateTime.UtcNow.AddSeconds(-15);
+        var approved = _deployment.ApprovedHostId;
+        var expectedHash = _rooms.CatalogHash;
+        if (expectedHash is null || expectedHash.Length != 64 ||
+            expectedHash.Any(character => character is not (>= '0' and <= '9' or >= 'a' and <= 'f')))
+            throw new HubException("room_content_unconfigured: Master needs the deployed Match catalog hash.");
+        var candidates = await _db.GameServers.Where(server =>
+            server.LastHeartbeat > cutoff && server.MaxConcurrentMatches > 0 &&
+            server.CurrentMatches < server.MaxConcurrentMatches &&
+            server.CatalogHash == expectedHash &&
+            (!_deployment.IsVps && server.ProtocolVersion == 0 ||
+                _deployment.IsVps && server.Id == approved &&
+                server.ProtocolVersion == 2 && server.SteamId != null &&
+                server.InstanceId != null && server.InstanceId != Guid.Empty))
+            .ToListAsync();
+        if (candidates.Count == 0)
+            return null;
+        var ids = candidates.Select(candidate => candidate.Id).ToArray();
+        var open = await _db.Matches.Where(match => match.ServerId != null &&
+            ids.Contains(match.ServerId.Value) &&
+            match.EndedAt == null && match.CanceledAt == null).ToListAsync();
+        return candidates.Select(server => new
+            {
+                Server = server,
+                Load = Math.Max(server.CurrentMatches, open.Count(match => match.ServerId == server.Id))
+            })
+            .Where(candidate => candidate.Load < candidate.Server.MaxConcurrentMatches)
+            .OrderBy(candidate => (double)candidate.Load / candidate.Server.MaxConcurrentMatches)
+            .ThenBy(candidate => candidate.Server.Id)
+            .Select(candidate => candidate.Server)
+            .FirstOrDefault();
+    }
+
+    public async Task<RoomSnapshot> CreateRoom(string name)
+    {
+        await _chat.MembershipGate.WaitAsync(Context.ConnectionAborted);
+        try
+        {
+            var (playerId, playerName) = await GetRoomPlayerAsync();
+            RoomMutationResult result;
+            ServerChatState roomChat;
+            lock (_chat.MembershipSync)
+            {
+                if (_chat.HasLobbyMembership(playerId))
+                    throw new HubException("already_in_room: Leave your GameServer lobby before creating a Room.");
+                result = _rooms.CreateRoom(playerId, name, playerName);
+                if (result.Error is not null)
+                    throw new HubException(result.Error);
+                roomChat = _chat.GetServerState(Context.ConnectionId);
+            }
+
+            await AddRoomConnectionsAsync(result);
+            await Clients.Group(RoomGroupName(result.RoomId)).SendAsync("RoomUpdated", result.Snapshot!);
+            await _directory.NotifyChangedAsync(Context.ConnectionAborted);
+            await Clients.Clients(result.ConnectionIds).SendAsync("ChatServerChanged", roomChat);
+            return result.Snapshot!;
+        }
+        finally
+        {
+            _chat.MembershipGate.Release();
+        }
+    }
+
+    public async Task<RoomSnapshot> JoinRoom(Guid roomId)
+    {
+        await _chat.MembershipGate.WaitAsync(Context.ConnectionAborted);
+        try
+        {
+            var (playerId, playerName) = await GetRoomPlayerAsync();
+            RoomMutationResult result;
+            ServerChatState roomChat;
+            lock (_chat.MembershipSync)
+            {
+                if (_chat.HasLobbyMembership(playerId))
+                    throw new HubException("already_in_room: Leave your GameServer lobby before joining a Room.");
+                result = _rooms.JoinRoom(roomId, playerId, playerName);
+                if (result.Error is not null)
+                    throw new HubException(result.Error);
+                roomChat = _chat.GetServerState(Context.ConnectionId);
+            }
+
+            await AddRoomConnectionsAsync(result);
+            if (result.Changed)
+            {
+                await Clients.Group(RoomGroupName(result.RoomId)).SendAsync("RoomUpdated", result.Snapshot!);
+                await _directory.NotifyChangedAsync(Context.ConnectionAborted);
+            }
+            await Clients.Clients(result.ConnectionIds).SendAsync("ChatServerChanged", roomChat);
+            return result.Snapshot!;
+        }
+        finally
+        {
+            _chat.MembershipGate.Release();
+        }
+    }
+
+    public async Task LeaveRoom()
+    {
+        if (!TryGetSteamId(out var playerId))
+            throw new HubException("Authenticated identity missing.");
+
+        await _chat.MembershipGate.WaitAsync(Context.ConnectionAborted);
+        try
+        {
+            RoomMutationResult result;
+            lock (_chat.MembershipSync)
+            {
+                result = _rooms.LeaveRoom(playerId);
+                if (result.Error is not null)
+                    throw new HubException(result.Error);
+            }
+
+            await RevokeRoomConnectionsAsync(result);
+            await RemoveRoomConnectionsAsync(result);
+            if (result.Snapshot!.MemberCount > 0)
+                await Clients.Group(RoomGroupName(result.RoomId)).SendAsync("RoomUpdated", result.Snapshot);
+            await _directory.NotifyChangedAsync(Context.ConnectionAborted);
+        }
+        finally
+        {
+            _chat.MembershipGate.Release();
+        }
+    }
+
+    private async Task<(long SteamId, string Name)> GetRoomPlayerAsync()
+    {
+        if (!TryGetSteamId(out var playerId))
+            throw new HubException("Authenticated identity missing.");
+        var user = await _db.Users.FindAsync(playerId);
+        if (user is null)
+            throw new HubException("Authenticated user not found.");
+        return (playerId, user.Username);
+    }
+
+    private Task AddRoomConnectionsAsync(RoomMutationResult result)
+        => Task.WhenAll(result.ConnectionIds.Select(connectionId =>
+            Groups.AddToGroupAsync(connectionId, RoomGroupName(result.RoomId))));
+
+    private async Task RevokeRoomConnectionsAsync(RoomMutationResult result)
+    {
+        if (result.ConnectionIds.Count == 0)
+            return;
+
+        await Clients.Clients(result.ConnectionIds)
+            .SendAsync("ChatServerChanged", new ServerChatState(null, []));
+        await Clients.Clients(result.ConnectionIds).SendAsync("RoomMembershipRevoked", result.RoomId);
+    }
+    private Task RemoveRoomConnectionsAsync(RoomMutationResult result)
+        => Task.WhenAll(result.ConnectionIds.Select(connectionId =>
+            Groups.RemoveFromGroupAsync(connectionId, RoomGroupName(result.RoomId))));
+
+
+    /// <summary>Explicitly leaves the current GameServer lobby.</summary>
     public async Task LeaveLobby()
     {
         if (!TryGetSteamId(out var playerId))
@@ -205,7 +521,6 @@ public sealed class LobbyHub : Hub
             _chat.MembershipGate.Release();
         }
         await AnnounceDeparture(departure.ServerId, departure.Player, departure.Snapshot);
-        await Clients.Caller.SendAsync("ChatServerChanged", new ServerChatState(null, []));
     }
 
     public async Task HostStart()
@@ -252,7 +567,16 @@ public sealed class LobbyHub : Hub
 
             config = result.Config!;
             var launch = await _launcher.LaunchAsync(config);
-            config = config with { MatchPort = launch.MatchPort, Content = launch.Content, Descriptor = launch.Descriptor };
+            if (launch.MatchId == Guid.Empty ||
+                launch.Descriptor is { } descriptor && descriptor.MatchId != launch.MatchId)
+                throw new InvalidOperationException("GameHost returned an invalid Match identity.");
+            config = config with
+            {
+                MatchPort = launch.MatchPort,
+                Content = launch.Content,
+                Descriptor = launch.Descriptor,
+                MatchId = launch.MatchId
+            };
 
             // Broadcast while the launched roster is still in the lobby group,
             // then remove its waiting slots while retaining server membership.
@@ -283,11 +607,19 @@ public sealed class LobbyHub : Hub
         await _chat.MembershipGate.WaitAsync();
         try
         {
+            RoomMutationResult? roomChange;
             lock (_chat.MembershipSync)
             {
+                roomChange = _rooms.Disconnect(Context.ConnectionId);
                 presence = _chat.Disconnect(Context.ConnectionId);
                 departure = _lobbies.DisconnectConnection(Context.ConnectionId);
             }
+
+            if (roomChange is { Snapshot: not null })
+                await Clients.Group(RoomGroupName(roomChange.RoomId))
+                    .SendAsync("RoomUpdated", roomChange.Snapshot);
+            if (roomChange is { Changed: true })
+                await _directory.NotifyChangedAsync();
         }
         finally
         {
@@ -329,5 +661,6 @@ public sealed class LobbyHub : Hub
         return claim is not null && long.TryParse(claim, NumberStyles.None, CultureInfo.InvariantCulture, out steamId);
     }
 
+    internal static string RoomGroupName(Guid roomId) => $"room:{roomId}";
     private static string GroupName(Guid serverId) => $"lobby:{serverId}";
 }

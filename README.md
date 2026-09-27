@@ -1,13 +1,16 @@
 # SlopArena Master Server
 
-Backend API for Steam Playtest sessions (or explicit development guests), game server registration, the server browser, SignalR lobbies, and game-wide chat.
-Matchmaking is planned but **not yet implemented**; the server browser is the current entry point.
+Backend API for Steam Playtest sessions (or explicit development guests), GameHost registration, the public Room browser, SignalR Room preparation, and game-wide chat.
+There is no matchmaking queue; players create or join named Rooms.
 
 ## Scope
 
-Runs the SlopArena pre-match flow: players self-select a fresh, non-full game server from the
-browser, join its lobby, and the host starts the match. No matchmaking exists yet — there is no
-queue, no pairing, and no skill/MMR matching (`User.Mmr` is stored but never used).
+The normal public entry path is Master-managed Rooms. A Room holds membership and
+Server Chat independently of physical GameHosts. The leader selects Characters and
+Arena, then Master assigns a compatible GameHost at Match launch. Authenticated
+GameHost completion/cancellation returns only the matching Room to Lobby with
+preparation cleared; membership and chat survive Results and rematch. Physical
+host/address lookup and waiting-roster control remain development-only.
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -15,9 +18,9 @@ queue, no pairing, and no skill/MMR matching (`User.Mmr` is stored but never use
 | `PUT /auth/name`, `POST /auth/refresh` | Chosen name and same-identity renewal (Steam requires a fresh web ticket) |
 | `POST /servers/register` | Trusted provisioned GUID + current Steam GameHost identity, protocol and process instance (development: IP:port) |
 | `POST /servers/{id}/heartbeat` | GameHost liveness/load and current identity check |
-| `GET /servers` | Fresh, compatible server browser |
-| `POST /match/result`, `POST /match/cancel` | Private authenticated completion or cancellation; no competitive result on cancellation |
-| `/lobby` (SignalR) | Versioned lobby admission, roster-only typed Steam match descriptor, chat and cancellation notices |
+| `GET /servers` | Physical GameHost lookup in development only; VPS returns 404 |
+| `POST /match/result`, `POST /match/cancel` | Authenticated terminal Match report, matching Room return; cancellation has no winner |
+| `/lobby` (SignalR) | Authenticated public Rooms, Room chat and scoped Match route; development-only physical lobbies |
 
 ## Tech Stack
 
@@ -113,9 +116,11 @@ and lowercase SHA-256 `catalogHash` of the admitted immutable content map.
 Master ignores request IP/UDP address and official flag. A heartbeat with a
 changed identity or catalog hash immediately makes the old browser entry
 ineligible. A fresh registration under the same host GUID pins the change,
-cancels its open matches, rotates the API token and notifies rostered clients;
-unchanged registration preserves load/token. No Steam ID is substituted into
-an IP field. Browser entries publish the current `serverSteamId` and protocol
+cancels its open matches and notifies rostered clients only when the host
+identity changes. Every successful registration issues a new API token; a
+same-identity refresh preserves match load but revokes the previous token.
+No Steam ID is substituted into an IP field. Browser entries publish the
+current `serverSteamId` and protocol
 only while heartbeat-fresh. Legacy imported rows cannot join, heartbeat or
 complete VPS matches.
 
@@ -151,22 +156,29 @@ shutdown is bounded to 15 seconds.
 `development` remains the explicit local mode: it retains unauthenticated
 IP:port upsert behavior and does not require `hostId`.
 
-The registration key, persisted API token, and match-control key have separate
-roles. The GameServer uses the registration key only for registration; it uses
-the API token returned by Master for heartbeat and match-result requests. Master
-uses the match-control key only for authenticated `POST /match/start`. Do not
-log credentials or place them in URLs.
+The registration key, API token, and match-control key have separate roles.
+The GameServer uses the registration key only for registration; it uses
+the API token returned by Master for heartbeat, match-result, and cancellation
+requests. Master stores only its SHA-256 digest in `GameServers.ApiTokenHash`;
+the bearer is returned once per registration and is never recoverable from the
+database. Do not log credentials or place them in URLs.
 
 Generate each secret independently, for example with
 `openssl rand -base64 48`, and store it only in the secret manager.
 
 Rotate the registration key by provisioning a new value on Master and the
-GameServer together, then restarting the host; this does not rotate the stored
-API token. Rotate the match-control key by updating Master and the GameServer
-control listener together. To rotate a persisted API token, deregister the host
-with its current API token (`DELETE /servers/{id}`), then restart it so its
-approved identity registers again and receives a new token; the browser entry is
-absent during that short rotation window.
+GameServer together, then restarting the host; this does not independently
+invalidate the active API token. Rotate the match-control key by updating
+Master and the GameServer control listener together. To revoke an API token,
+re-register with the approved registration key; the previous bearer stops
+authenticating immediately. Drain active matches before intentionally rotating
+credentials on a live host.
+
+Apply `HashGameServerApiTokens` before deploying this Master version: it
+converts existing plaintext values in PostgreSQL without disconnecting
+running hosts. The migration is irreversible; an older Master cannot use
+the hashed column, so do not roll back the application without an
+operator-reviewed database recovery and host re-enrollment.
 
 ## Container release and migrations
 
@@ -209,8 +221,8 @@ SlopArena-MasterServer/
 ├── Migrations/     # Versioned PostgreSQL schema
 ├── DTOs/           # API request/response models
 ├── Chat/           # Bounded chat state, immutable wire records, validation, quotas
-├── Hubs/           # Authenticated LobbyHub: chat + per-server lobby flow
-├── Lobbies/        # LobbyManager (in-memory lobby authority) + HTTP match launcher
+├── Hubs/           # Authenticated LobbyHub: Rooms, chat + per-server lobby flows
+├── Rooms/          # RoomManager (in-memory public Room authority)
 ├── Steam/          # Playtest ticket verification and durable replay store
 ├── Program.cs      # ASP.NET entry point
 └── appsettings.json
@@ -218,6 +230,114 @@ SlopArena-MasterServer/
 
 Master does not depend on the Shared simulation or a private NuGet feed.
 Gameplay remains in the GameServer and Shared simulation.
+
+
+## Public Room client contract
+
+The authenticated `/lobby` SignalR hub exposes a public Room browser and membership API. Rooms
+are owned by Master memory and do not reserve a GameHost or simulation slot.
+
+| Call | Arguments | Return |
+| --- | --- | --- |
+| `GetRooms` | none | `RoomSummary[]`, public Rooms only |
+| `CreateRoom` | `name` | `RoomSnapshot`; creator is the first member and leader |
+| `JoinRoom` | `roomId` | `RoomSnapshot`; joining an existing Room is idempotent for its current member |
+| `GetMyRoom` | none | This Steam identity's `RoomSnapshot`, or `null` |
+| `LeaveRoom` | none | no return; explicitly leaves the current Room |
+| `RoomStartCharacterSelect` | none | leader advances Lobby → Character Select (2–4 members) |
+| `RoomSelectCharacter` | admitted Character selector | member locks in a Character in Character Select |
+| `RoomStartStageSelect` | none | leader advances after every member locks in |
+| `RoomChooseArena` | admitted Arena name | leader sets the Arena in Stage Select; does not launch a Match |
+| `RoomStartMatch` | none | leader allocates a compatible GameHost for a prepared Room and returns the Match route |
+
+`RoomDirectoryChanged` is a payload-free push to connected browser clients when
+a public Room summary changes (creation, membership, phase, leadership, expiry
+or terminal return). Clients re-read `GetRooms`; it never carries chat, a Match
+descriptor or an unauthorized member roster. `RoomUpdated` remains Room-scoped.
+
+`RoomSummary` contains `id`, `name`, `phase`, `leaderSteamId`, `memberCount`, `capacity`, and
+`joinable`. `RoomSnapshot` adds `arenaName`, deployment-pinned `admittedCharacters` and
+`admittedArenas`, and ordered `members`; each member contains `steamId`, `name`, `isLeader`,
+`characterSelection`, and `lockedIn`. Phases are `Lobby`, `Character Select`,
+`Stage Select`, `Match Starting`, and `In Match`; snapshots also expose `activeMatchId`
+while launching/fighting. Only Lobby Rooms are joinable. Names are trimmed, literal text with
+1–24 valid Unicode scalar values; blank, malformed, control-bearing, and line-separator
+names are rejected; formatting controls are rejected except Unicode joiners. Duplicate
+Room names are allowed and each Room has its own GUID.
+
+Master allows at most five Rooms and four members per Room. Membership is keyed by the verified
+Steam identity, never by a connection or caller-supplied ID. Reconnecting before the 15-second
+deadline reattaches without allocating another slot or changing join order. A disconnected leader
+keeps leadership during grace, including when another player joins. At the deadline the member
+expires and the oldest connected remaining member takes over; a later return joins at the end
+without reclaiming leadership. Explicit `LeaveRoom` transfers leadership immediately to the
+oldest eligible remaining member. A Room with no members remains listed and joinable for 60
+seconds, with `leaderSteamId` of `0`, then expires and frees its slot. Members
+disconnected during an active Match retain their place until the Match terminates.
+Explicit development GameHost-lobby membership cannot overlap a Room; production
+has no physical-lobby admission.
+Room preparation and broadcasts use the Room GUID, never a GameServer lobby. The leader
+advances phases; every member may lock in or change an admitted Character during Character
+Select. Stage Select requires 2–4 locked-in members. Only the leader may choose an admitted
+Arena. Room membership dropping below two resets preparation to Lobby and clears picks;
+other departures clear the Arena and require the leader to choose it again.
+`RoomStartMatch` atomically freezes the selected roster; only its Room group receives
+the `MatchStarted` payload with a nonempty root `matchId`, the physical `serverId`,
+content map and Steam descriptor in VPS mode (development sends the selected
+GameHost's `serverAddress` plus assigned UDP `matchPort`). When present, the
+Steam descriptor carries the same Match ID. Explicit development physical-lobby
+launches also carry the GameHost's root Match ID. The Match row records nullable
+`roomId` separately from physical `serverId` (older rows remain null). Launch
+failure returns to Stage Select with selections and Arena intact. A Room launch
+passes a 60-second admission deadline; an unfilled Match expires even if a
+failed launch could not deliver the abort command. Disconnected members are not
+pruned during an active Match. A GameHost result or cancellation updates only the
+Room with that exact active Match ID, once: Lobby phase, no active ID, Arena or
+Character Lock-in, with current membership and Server Chat intact. A late or
+duplicate report cannot reset a rematch. Cancellations notify only the affected
+Match roster with `MatchAborted` and record no winner. Unity keeps Results
+viewable until the player elects to return and checks current Room membership.
+
+When an open Match's GameHost has missed heartbeats for at least 60 seconds,
+Master probes its control `/health` with a two-second bound. Only an unreachable
+host whose heartbeat and process identity remain unchanged is canceled as
+`host_unavailable`; a healthy GameHost is not canceled solely because Master
+missed heartbeats. This uses the same idempotent terminal transition and
+preserves unrelated Rooms and chats.
+
+`Room:AdmittedCharacters` and `Room:AdmittedArenas` are deployment-pinned selectors.
+`Room:CatalogHash` defaults to the current cooked roster's 64-character GameHost
+content hash; update it with each accepted content release or override via
+`Room__CatalogHash` using the admitted GameHost's registered hash. Master filters
+hosts by fresh heartbeat, matching hash and protocol, approved-host policy in
+VPS mode, and free capacity; lowest occupied/capacity ratio wins with a stable
+GUID tie-break.
+GameHost returns its actual content hash at launch; Master rejects/aborts a
+development Match if it differs from the pin. Keep selectors and hash aligned
+with shipped cooked content and available PvP arenas. Master refuses to start
+without nonempty selector lists and rejects unknown picks; GameHost still
+validates content again at launch.
+
+
+Server Chat is Room-scoped. `ChatServerChanged` publishes the Room ID and that
+Room's bounded history when an identity creates or joins a Room and whenever a
+connection reconnects. Leaving or losing Room membership clears the chat state
+with a null Room ID before `RoomMembershipRevoked`. The 15-second disconnect
+grace reattaches the same Room membership; reconnecting after expiry receives
+null state and cannot send to the old Room.
+
+While a player is in a Room, authenticated `PUT /auth/name` updates that member's roster name
+and pushes the refreshed snapshot to Room members.
+
+`RoomUpdated` pushes the full `RoomSnapshot` to the Room group after roster, phase,
+Character Lock-in, Arena, or leader changes.
+`RoomMembershipRevoked` pushes the Room GUID to every active connection of an
+identity after a null `ChatServerChanged` and before its Room-group attachments
+are removed. `RoomDeleted` pushes the Room GUID when an empty Room expires.
+Hub errors include stable prefixes and guidance: `invalid_room_name`, `room_limit`,
+`already_in_room`, `room_not_found`, `room_full`, `room_selecting`, `not_in_room`,
+`not_leader`, `invalid_phase`, `room_not_ready`, `character_not_admitted`, and
+`arena_not_admitted`.
 
 ## Chat client contract
 
@@ -247,7 +367,9 @@ Unity ownership, UI, local mute, drafts, scrollback, and input isolation are sep
    same bearer token, and the hub query-token route remains supported.
    Master closes even an established WebSocket when that JWT expires; it does
    not trust the client to reconnect voluntarily. A fresh valid token starts a
-   new hub connection and revalidates remembered Server Chat/roster membership.
+   new hub connection, reattaches Room membership within its grace period,
+   and can separately revalidate remembered GameServer admission with
+   `ResumeServer`. Physical admission never grants Server Chat.
    Hub expiration never calls GameHost match cancellation.
 
 Do not log tokens or token-bearing URLs. `GET /auth/me` returns
@@ -270,9 +392,9 @@ JSON uses camelCase. The C# records are in `Chat/ChatModels.cs`.
 | Record | Fields |
 | --- | --- |
 | `ChatPlayer` | `playerId` (opaque string), `displayName`, `sessionTag` |
-| `ChatMessage` | `messageId` (GUID), `sequence`, `channel`, `serverId` (nullable GUID), `recipientId` (nullable string), `sender` (`ChatPlayer`), `text`, `sentAt` (UTC timestamp) |
+| `ChatMessage` | `messageId` (GUID), `sequence`, `channel`, `roomId` (nullable GUID), `recipientId` (nullable string), `sender` (`ChatPlayer`), `text`, `sentAt` (UTC timestamp) |
 | `ChatPresence` | `player` (`ChatPlayer`), `online` |
-| `ServerChatState` | `serverId` (nullable GUID), `messages` (`ChatMessage[]`) |
+| `ServerChatState` | `roomId` (nullable GUID), `messages` (`ChatMessage[]`) |
 | `ChatSnapshot` | `self` (`ChatPlayer`), `globalMessages`, `server` (`ServerChatState`) |
 
 Channel values are `global`, `server`, and `direct`. Master sets sender identity,
@@ -291,9 +413,8 @@ on restart. Do not compare sequences from different Master lifetimes.
 | `GetChatState` | none | `ChatSnapshot` for this connection |
 | `GetOnlinePlayers` | none | `ChatPlayer[]`, one entry per online identity |
 | `SendGlobal` | `text` | Accepted `ChatMessage` |
-| `SendServer` | `serverId`, `text` | Accepted `ChatMessage` |
+| `SendServer` | `roomId`, `text` | Accepted `ChatMessage` |
 | `SendDirect` | `playerId`, `text` | Accepted `ChatMessage` |
-| `ResumeServer` | `serverId` | no return; emits `ChatServerChanged`; reconnect-only chat membership |
 
 Existing lobby calls remain: `JoinLobby`, `ResumeServer`, `LeaveLobby`, `HostStart`,
 `SelectCharacter`, `StartStageSelect`, and `StartMatch(arenaName)`. Their existing
@@ -305,30 +426,30 @@ authoritative GameServer `content` JSON element alongside `matchPort` and
 | --- | --- | --- |
 | `ChatMessage` | `ChatMessage` | A live message, including the sender's echo |
 | `ChatPresenceChanged` | `ChatPresence` | First connection, last disconnect, or online rename |
-| `ChatServerChanged` | `ServerChatState` | The caller's successful join/resume/switch/leave and current server backlog |
+| `ChatServerChanged` | `ServerChatState` | Current Room chat state after create/join/reconnect, or null Room ID and empty messages after leave/revocation |
 
 Presence pushes are change notifications, not a durable ordered directory stream.
 Use `GetOnlinePlayers` for current state and after reconnect. Coalesce refreshes
 within the control budget. A failed query is not an empty directory.
 
-Global reaches every chat-connected participant. Server Chat reaches connections
-currently admitted to that GameServer through authoritative membership, not a
-waiting roster or match group. A successful `JoinLobby` admits Server Chat even
-when the 2–4 waiting roster is full; it then reports `lobby_full`, sends
-`ChatServerChanged`, and does not emit lobby-roster events. `ResumeServer` is
-only for reconnecting an identity's bounded remembered admission and never
-re-enters a waiting roster. `JoinLobby` is the explicit waiting-room/rematch
-operation.
+Global reaches every chat-connected participant. Server Chat reaches only
+connections whose verified identity is actively attached to the same Room in
+`RoomManager`. The caller-supplied `roomId` never grants access. Physical
+GameServer lobby membership, match groups, and remembered GameServer admission
+do not grant Server Chat; `JoinLobby` and `ResumeServer` never change Room chat
+state. `GetChatState` and `SendServer` use active Room membership, and an
+unauthorized or guessed Room ID is rejected with `not_in_room`.
 
-Join requires a registered GameServer with a heartbeat no older than 15 seconds.
-Unknown/stale admission leaves existing membership unchanged. Server membership
-survives character/stage selection and match launch; launched players leave the
-waiting roster slots while retaining the GameServer channel. Leave/switch
-updates authoritative membership before later messages are accepted. Disconnect
-drops live connection membership but retains a bounded, expiring identity
-admission for `ResumeServer`; explicit Leave clears it. Reconnect must call
-`ResumeServer` for an in-match connection or `JoinLobby` for a waiting/rematch
-entry. Do not trust a locally remembered server ID.
+Room creation/join, reconnect attachment, leave, and expiry serialize with
+Server Chat sends and delivery. A send accepted before leave is queued before the
+revocation push; a send after leave is rejected. A Room's backlog is bounded
+and keyed by its own GUID; deleting the Room also deletes its chat history.
+
+Physical lobby admission is limited to explicit development host/address
+workflows. VPS rejects `JoinLobby` and `ResumeServer` with
+`physical_admission_disabled`, and does not publish `GET /servers`.
+Development physical membership never grants Server Chat; the normal
+browser and Room preparation use Room methods instead.
 
 Direct reaches the sender's and target identity's live connections, once each.
 An offline target fails. There is no server-side Direct history or offline queue,
@@ -342,12 +463,12 @@ and a new guest with the same name is not the old recipient.
 | Message length | 500 Unicode scalar values, not UTF-16 units |
 | Send attempts | 5 per sliding 5 seconds, shared across channels and connections |
 | Other hub calls | 20 per sliding 10 seconds per identity |
-| Public backlog | 50 Global messages; 50 per retained GameServer |
-| Retained GameServer backlogs | 256; evict the least-recently-used idle channel, not an active one |
+| Public backlog | 50 Global messages; 50 per retained Room |
+| Room backlogs | At most five, matching the live Room limit; deleted with their Room |
 | Retained quota entries | 1,024 per budget; expire old entries before admitting more |
 | Remembered Server admissions | 1,024 identities; 24-hour expiry/LRU eviction; explicit Leave clears |
 Quota time is monotonic. Reconnect does not reset either budget. Invalid text,
-unauthorized server targets, and offline Direct attempts consume send allowance.
+unauthorized Room targets, and offline Direct attempts consume send allowance.
 HTTP write limits remain separate: by default, 10 requests per 10 seconds per IP
 in each guest/name/refresh/negotiate/control category. Only the `/lobby` transport
 path is exempt; negotiation is not. Configure the HTTP count with
@@ -358,11 +479,11 @@ breaks remain literal; other control characters are rejected. Master does not
 parse markup or links. The client must render names and text literally.
 
 Hub failures use `invalid_message`, `rate_limited`, `control_rate_limited`,
-`not_connected`, `not_in_server`, `recipient_offline`, `chat_capacity`,
-`already_joined`, `server_unavailable`, `lobby_full`, or `not_admitted`. The
-framework can wrap these codes in its error text. Invalid names return HTTP 400
+`not_connected`, `not_in_room`, `recipient_offline`, or `chat_capacity`. Physical
+lobby operations retain their separate failures such as `already_joined`,
+`server_unavailable`, `lobby_full`, and `not_admitted`. The framework can wrap
+these codes in its error text. Invalid names return HTTP 400
 `{ "error": "invalid_name" }`.
-Existing lobby-specific failures remain separate.
 
 Public history and presence exist only in this Master process. Restart clears
 them; chat bodies are not persisted or logged. A successful send response means
@@ -380,11 +501,12 @@ dotnet test MasterServer.Tests/MasterServer.Tests.csproj --nologo
 
 SignalR integration tests exercise the live ASP.NET pipeline over TestServer and
 use isolated EF InMemory stores. Registration tests cover development and VPS
-HTTP behavior, stable token/load refreshes, and concurrent duplicate refreshes;
-the in-memory provider does **not** prove PostgreSQL uniqueness or concurrent
-insert arbitration. Verify that race against PostgreSQL before claiming
-relational behavior. Launcher tests replace the external GameServer HTTP
-boundary and assert private VPS routing plus bearer authentication.
+HTTP behavior, hash-only persistence, rotation on re-registration, and duplicate
+refreshes. The in-memory provider does **not** prove PostgreSQL uniqueness,
+migration conversion, or concurrent insert arbitration. Verify those against
+PostgreSQL before claiming relational behavior.
+Launcher tests replace the external GameServer HTTP boundary and assert
+private VPS routing plus bearer authentication.
 
 If the SDK is installed without the ASP.NET runtime, an isolated self-contained
 test build can restore the existing framework runtime packs instead:

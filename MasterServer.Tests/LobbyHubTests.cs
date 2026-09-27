@@ -5,8 +5,10 @@ using MasterServer.Chat;
 using MasterServer.Data;
 using MasterServer.Hubs;
 using MasterServer.Lobbies;
+using MasterServer.Rooms;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -38,17 +40,36 @@ public class LobbyHubTests
     {
         private readonly AppDbContext _db;
         public LobbyManager Lobbies { get; }
+        public RoomManager Rooms { get; }
         public ChatService Chat { get; }
         public Mock<IMatchLauncher> Launcher { get; } = new();
         public Mock<IHubCallerClients> Clients { get; } = new();
+        public Mock<IHubClients> HubClients { get; } = new();
+        public Mock<IHubContext<LobbyHub>> HubContext { get; } = new();
         public Mock<IGroupManager> Groups { get; } = new();
         public Mock<IClientProxy> GroupProxy { get; } = new();
+        public Mock<IClientProxy> AllProxy { get; } = new();
+        public RoomDirectoryNotifier Directory { get; }
+        public Guid LaunchMatchId { get; } = Guid.NewGuid();
 
         public HubHarness(AppDbContext db)
         {
             _db = db;
             Lobbies = new LobbyManager();
-            Chat = new ChatService(Lobbies, TimeProvider.System);
+            Rooms = new RoomManager(TimeProvider.System,
+                new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+                    .AddInMemoryCollection(new Dictionary<string, string?>
+                    {
+                        ["Room:AdmittedCharacters:0"] = "Manki",
+                        ["Room:AdmittedArenas:0"] = "slop_pit"
+                    }).Build());
+            Chat = new ChatService(Lobbies, Rooms, TimeProvider.System);
+            HubClients.SetupGet(clients => clients.All).Returns(AllProxy.Object);
+            HubContext.SetupGet(context => context.Clients).Returns(HubClients.Object);
+            AllProxy.Setup(proxy => proxy.SendCoreAsync(
+                It.IsAny<string>(), It.IsAny<object?[]>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            Directory = new RoomDirectoryNotifier(HubContext.Object);
             db.GameServers.Add(new MasterServer.Data.Models.GameServer
             {
                 Id = ServerId,
@@ -63,7 +84,8 @@ public class LobbyHubTests
             Launcher.Setup(l => l.LaunchAsync(It.IsAny<MatchStartedConfig>()))
                 .ReturnsAsync(new MatchLaunchResult(
                     9877,
-                    JsonDocument.Parse("""{"schemaVersion":1,"entries":[]}""").RootElement.Clone()));
+                    JsonDocument.Parse("""{"schemaVersion":1,"entries":[]}""").RootElement.Clone(),
+                    MatchId: LaunchMatchId));
         }
 
         public LobbyHub CreateHub(string connectionId, long steamId, string username)
@@ -95,7 +117,9 @@ public class LobbyHubTests
                 Launcher.Object,
                 Mock.Of<ILogger<LobbyHub>>(),
                 Chat,
-                MasterServer.Configuration.MasterDeploymentOptions.Development)
+                MasterServer.Configuration.MasterDeploymentOptions.Development,
+                Rooms,
+                Directory)
             {
                 Context = ctx.Object,
                 Clients = Clients.Object,

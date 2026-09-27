@@ -52,13 +52,17 @@ public sealed record MatchStartedConfig(
     int MatchPort = 0,
     string ArenaName = "",
     JsonElement? Content = null,
-    SteamMatchDescriptor? Descriptor = null);
+    SteamMatchDescriptor? Descriptor = null,
+    Guid? RoomId = null,
+    Guid MatchId = default,
+    string? CatalogHash = null,
+    string? ServerAddress = null);
 
 /// <summary>
 /// Result of a player entering a GameServer. <c>Success</c> means a waiting
-/// roster slot was admitted. <c>ServerAdmitted</c> means authoritative Server
-/// Chat membership was admitted; it remains true when the waiting roster is
-/// full and <c>Error</c> is <c>lobby_full</c>-equivalent.
+/// roster slot was admitted. <c>GameServerAdmitted</c> means physical
+/// GameServer membership was admitted; it remains true when the waiting roster
+/// is full and <c>Error</c> is <c>lobby_full</c>-equivalent.
 /// </summary>
 public sealed record JoinLobbyResult(
     bool Success,
@@ -66,11 +70,11 @@ public sealed record JoinLobbyResult(
     LobbyPlayer? Player,
     LobbySnapshot? Snapshot,
     LeaveLobbyResult? Departure,
-    bool ServerAdmitted = false);
+    bool GameServerAdmitted = false);
 
 /// <summary>GameHost match-start response. Master forwards authoritative content unchanged.</summary>
 public sealed record MatchLaunchResult(int MatchPort, JsonElement Content,
-    SteamMatchDescriptor? Descriptor = null);
+    SteamMatchDescriptor? Descriptor = null, Guid MatchId = default);
 
 /// <summary>
 /// Result of a player leaving a lobby (or disconnecting). <c>ServerId</c> is null

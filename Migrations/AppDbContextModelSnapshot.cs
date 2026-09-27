@@ -28,10 +28,10 @@ namespace MasterServer.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("uuid");
 
-                    b.Property<string>("ApiToken")
+                    b.Property<string>("ApiTokenHash")
                         .IsRequired()
-                        .HasMaxLength(128)
-                        .HasColumnType("character varying(128)");
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
 
                     b.Property<string>("CatalogHash")
                         .HasMaxLength(64)
@@ -118,6 +118,8 @@ namespace MasterServer.Migrations
                     b.Property<long?>("Player4SteamId")
                         .HasColumnType("bigint");
 
+                    b.Property<Guid?>("RoomId")
+                        .HasColumnType("uuid");
                     b.Property<Guid?>("ServerId")
                         .HasColumnType("uuid");
 
@@ -138,6 +140,7 @@ namespace MasterServer.Migrations
 
                     b.HasIndex("Player2SteamId");
                     b.HasIndex("ServerId");
+                    b.HasIndex("RoomId");
 
 
                     b.HasIndex("WinnerSteamId");
