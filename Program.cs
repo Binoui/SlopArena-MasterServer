@@ -538,10 +538,10 @@ app.MapPost("/servers/register", async (
             return Results.Unauthorized();
     }
     if (deployment.IsVps &&
-        (request.ProtocolVersion != 2 || !TrySteamIdentity(request.SteamId, out _) ||
+        (request.ProtocolVersion != SteamMatchDescriptor.Protocol || !TrySteamIdentity(request.SteamId, out _) ||
          request.InstanceId is null || request.InstanceId == Guid.Empty ||
          !IsCatalogHash(request.CatalogHash)))
-        return Results.BadRequest(new { error = "Current Steam identity, process instance, catalog hash and protocol 2 are required." });
+        return Results.BadRequest(new { error = $"Current Steam identity, process instance, catalog hash and protocol {SteamMatchDescriptor.Protocol} are required." });
     if (!deployment.IsVps && request.CatalogHash is not null &&
         !IsCatalogHash(request.CatalogHash))
         return Results.BadRequest(new { error = "Invalid development catalog hash." });
@@ -697,7 +697,7 @@ app.MapPost("/servers/{serverId}/heartbeat", async (
             return Results.Unauthorized();
         }
         if (deployment.IsVps && (server.SteamId != request.SteamId ||
-            server.InstanceId != request.InstanceId || server.ProtocolVersion != 2 ||
+            server.InstanceId != request.InstanceId || server.ProtocolVersion != SteamMatchDescriptor.Protocol ||
             server.CatalogHash != request.CatalogHash))
         {
             // Stop advertising the superseded identity immediately; an authenticated

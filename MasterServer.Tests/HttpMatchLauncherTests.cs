@@ -43,6 +43,7 @@ public class HttpMatchLauncherTests
         public System.Net.Http.Headers.AuthenticationHeaderValue? Authorization { get; private set; }
         public bool SteamResponse { get; set; }
         public string ResponseSteamId { get; set; } = "90293421017699331";
+        public int ResponseProtocolVersion { get; set; } = 4;
         public int AbortCalls { get; private set; }
         public string ResponseBody { get; set; } = """{"port":9877,"content":{"schemaVersion":1,"entries":[]}}""";
 
@@ -65,7 +66,7 @@ public class HttpMatchLauncherTests
                     matchId = doc.RootElement.GetProperty("matchId").GetString(),
                     serverSteamId = ResponseSteamId,
                     virtualPort = 0,
-                    protocolVersion = 2,
+                    protocolVersion = ResponseProtocolVersion,
                     contentHash = new string('a', 64),
                     content = new { schemaVersion = 1, entries = Array.Empty<object>() }
                 });
@@ -90,7 +91,7 @@ public class HttpMatchLauncherTests
             ApiTokenHash = new string('0', 64),
             LastHeartbeat = DateTime.UtcNow,
             SteamId = steamId,
-            ProtocolVersion = steamId is null ? 0 : 2,
+            ProtocolVersion = steamId is null ? 0 : 4,
             InstanceId = steamId is null ? null : Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
             CatalogHash = steamId is null ? null : new string('a', 64),
         });
@@ -179,7 +180,7 @@ public class HttpMatchLauncherTests
         Assert.NotNull(result.Descriptor);
         Assert.Equal("90293421017699331", result.Descriptor!.ServerSteamId);
         Assert.Equal(result.Descriptor.MatchId, Assert.Single(db.Matches).Id);
-        Assert.Equal(2, result.Descriptor.ProtocolVersion);
+        Assert.Equal(4, result.Descriptor.ProtocolVersion);
         Assert.Equal(0, result.Descriptor.VirtualPort);
         Assert.Equal(new string('a', 64), result.Descriptor.ContentHash);
         using var posted = JsonDocument.Parse(handler.RequestBody);
@@ -190,6 +191,24 @@ public class HttpMatchLauncherTests
     public async Task VpsLauncher_RejectsUnexpectedHostAndAbortsAllocatedMatch()
     {
         var handler = new StubHandler { SteamResponse = true, ResponseSteamId = "90293421017699399" };
+        var db = SeedServer("attacker.example", 4321, "90293421017699331");
+        var deployment = new MasterDeploymentOptions(
+            "vps", ServerId, "registration-key", "public.example", 9876,
+            new Uri("http://gameserver.internal:9876/match/start"), "match-control-key");
+        var launcher = CreateLauncher(db, new HttpClient(handler), deployment);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            launcher.LaunchAsync(new MatchStartedConfig(ServerId, TwoPlayerRoster(), 0, "slop_court")));
+
+        Assert.Empty(db.Matches);
+        Assert.Equal(1, handler.AbortCalls);
+        Assert.Equal("http://gameserver.internal:9876/match/abort", handler.RequestUri!.ToString());
+    }
+
+    [Fact]
+    public async Task VpsLauncher_RejectsIncompatibleReturnedProtocolAndCleansUp()
+    {
+        var handler = new StubHandler { SteamResponse = true, ResponseProtocolVersion = 2 };
         var db = SeedServer("attacker.example", 4321, "90293421017699331");
         var deployment = new MasterDeploymentOptions(
             "vps", ServerId, "registration-key", "public.example", 9876,

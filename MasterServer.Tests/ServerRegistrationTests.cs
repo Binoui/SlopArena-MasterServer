@@ -14,6 +14,7 @@ using Microsoft.Extensions.DependencyInjection;
 using MasterServer.Data;
 using MasterServer.Data.Models;
 using MasterServer.DTOs;
+using MasterServer.Lobbies;
 using Xunit;
 
 namespace MasterServer.Tests;
@@ -121,7 +122,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         CustomRulesJson: null,
         HostId: ApprovedHostId,
         SteamId: "90293421017699331",
-        ProtocolVersion: 2,
+        ProtocolVersion: 4,
         InstanceId: HostInstance,
         CatalogHash: new string('a', 64));
 
@@ -446,7 +447,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         Assert.Equal(28765, row.Port);
         Assert.True(row.IsOfficial);
         Assert.Equal("90293421017699331", row.SteamId);
-        Assert.Equal(2, row.ProtocolVersion);
+        Assert.Equal(4, row.ProtocolVersion);
         Assert.Equal(3, row.CurrentMatches);
 
         Assert.NotEqual(second.ApiToken, row.ApiTokenHash);
@@ -523,6 +524,17 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         Assert.Equal("host_restart", canceled.CancelReason);
         Assert.Null(canceled.EndedAt);
         Assert.Null(canceled.WinnerSteamId);
+    }
+
+    [Fact]
+    public async Task VpsRegistration_RejectsSupersededProtocolBeforeAdvertisingHost()
+    {
+        using var client = CreateVpsClient();
+        using var response = await PostVpsRegistrationAsync(
+            client, VpsRequest() with { ProtocolVersion = 2 }, RegistrationKey);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(0, await CountVpsGameServersAsync());
     }
 
     [Fact]

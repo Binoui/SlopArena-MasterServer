@@ -363,7 +363,7 @@ public sealed class LobbyHub : Hub
             server.CatalogHash == expectedHash &&
             (!_deployment.IsVps && server.ProtocolVersion == 0 ||
                 _deployment.IsVps && server.Id == approved &&
-                server.ProtocolVersion == 2 && server.SteamId != null &&
+                server.ProtocolVersion == SteamMatchDescriptor.Protocol && server.SteamId != null &&
                 server.InstanceId != null && server.InstanceId != Guid.Empty))
             .ToListAsync();
         if (candidates.Count == 0)
@@ -639,7 +639,7 @@ public sealed class LobbyHub : Hub
         return await _db.GameServers.AnyAsync(
             server => server.Id == serverId && server.LastHeartbeat >= cutoff &&
                 (!_deployment.IsVps || (server.SteamId != null &&
-                    server.InstanceId != null && server.ProtocolVersion == 2)),
+                    server.InstanceId != null && server.ProtocolVersion == SteamMatchDescriptor.Protocol)),
             Context.ConnectionAborted);
     }
 

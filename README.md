@@ -111,7 +111,7 @@ literal.
 
 In VPS mode, `/servers/register` requires the provisioned host GUID,
 `Authorization: Bearer <ApprovedHost:RegistrationKey>`, canonical decimal-string
-GameHost `steamId`, `protocolVersion: 2`, nonempty per-process `instanceId` GUID,
+GameHost `steamId`, `protocolVersion: 4`, nonempty per-process `instanceId` GUID,
 and lowercase SHA-256 `catalogHash` of the admitted immutable content map.
 Master ignores request IP/UDP address and official flag. A heartbeat with a
 changed identity or catalog hash immediately makes the old browser entry
@@ -129,7 +129,7 @@ Master creates the authoritative Match row and roster before its private
 content identity. GameHost rejects a changed local map before allocation and
 responds with cooked content, the matching digest and its own verified Steam
 identity. Only that roster receives a `MatchStarted.descriptor` (`steam-p2p`,
-host identity, GUID, virtual port 0, protocol 2, content digest, admission
+host identity, GUID, virtual port 0, protocol 4, content digest, admission
 deadline); old clients are denied a VPS lobby slot. GameHost controls admission
 and authoritative simulation.
 It reports normal results once, or calls authenticated `POST /match/cancel`

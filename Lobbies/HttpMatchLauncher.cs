@@ -64,7 +64,7 @@ public sealed class HttpMatchLauncher : IMatchLauncher
                 $"Game server {config.ServerId} is not registered — cannot start match.");
         if (_deployment.IsVps)
         {
-            if (server.ProtocolVersion != 2 || string.IsNullOrEmpty(server.SteamId) ||
+            if (server.ProtocolVersion != SteamMatchDescriptor.Protocol || string.IsNullOrEmpty(server.SteamId) ||
                 (server.InstanceId is null || server.InstanceId == Guid.Empty) ||
                 server.CatalogHash is not { Length: 64 } ||
                 server.LastHeartbeat < DateTime.UtcNow.AddSeconds(-15))
@@ -134,7 +134,7 @@ public sealed class HttpMatchLauncher : IMatchLauncher
         };
         if (_deployment.IsVps)
         {
-            body["protocolVersion"] = 2;
+            body["protocolVersion"] = SteamMatchDescriptor.Protocol;
             body["virtualPort"] = 0;
             body["maxStocks"] = 3;
             body["catalogHash"] = catalogAtStart;
@@ -172,11 +172,11 @@ public sealed class HttpMatchLauncher : IMatchLauncher
                 if (result.MatchId != matchGuid || result.ServerSteamId != steamIdAtStart ||
                     server.SteamId != steamIdAtStart || server.InstanceId != instanceAtStart ||
                     server.CatalogHash != catalogAtStart || result.ContentHash != catalogAtStart ||
-                    server.ProtocolVersion != 2 || server.LastHeartbeat < DateTime.UtcNow.AddSeconds(-15) ||
-                    result.ProtocolVersion != 2 || result.VirtualPort != 0)
+                    server.ProtocolVersion != SteamMatchDescriptor.Protocol || server.LastHeartbeat < DateTime.UtcNow.AddSeconds(-15) ||
+                    result.ProtocolVersion != SteamMatchDescriptor.Protocol || result.VirtualPort != 0)
                     throw new InvalidOperationException("GameHost returned an incompatible or stale Steam match route.");
                 var descriptor = new SteamMatchDescriptor("steam-p2p", result.ServerSteamId!,
-                    matchGuid, 0, 2, result.ContentHash!, admissionDeadline);
+                    matchGuid, 0, SteamMatchDescriptor.Protocol, result.ContentHash!, admissionDeadline);
                 _logger.LogInformation("Steam match {MatchId} launched on host {ServerId}", matchId, server.Id);
                 return new MatchLaunchResult(0, result.Content.Clone(), descriptor, matchGuid);
             }

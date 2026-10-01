@@ -43,7 +43,11 @@ public sealed record SteamMatchDescriptor(
     int VirtualPort,
     int ProtocolVersion,
     string ContentHash,
-    DateTimeOffset AdmissionExpiresAtUtc);
+    DateTimeOffset AdmissionExpiresAtUtc)
+{
+    public const int Protocol = 4;
+}
+
 
 /// <summary>Match push sent only to its locked-in roster.</summary>
 public sealed record MatchStartedConfig(
