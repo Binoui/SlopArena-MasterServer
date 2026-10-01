@@ -508,6 +508,11 @@ PostgreSQL before claiming relational behavior.
 Launcher tests replace the external GameServer HTTP boundary and assert
 private VPS routing plus bearer authentication.
 
+Room reconnect tests synchronize on the server's offline `ChatPresenceChanged`
+push before advancing an injected clock. Client `StopAsync` alone does not
+acknowledge completion of `OnDisconnectedAsync`; advancing first can start the
+15-second grace period after the intended deadline and miss leader promotion.
+
 If the SDK is installed without the ASP.NET runtime, an isolated self-contained
 test build can restore the existing framework runtime packs instead:
 

@@ -699,7 +699,11 @@ public sealed class RoomIntegrationTests : IDisposable
         var bob = await ConnectAsync(factory, await RegisterPlayerAsync(client, "Bob"));
         var room = await alice.InvokeAsync<RoomSnapshot>("CreateRoom", "Ordered");
         await bob.InvokeAsync<RoomSnapshot>("JoinRoom", room.Id);
+        var alicePlayerId = (await alice.InvokeAsync<ChatSnapshot>("GetChatState")).Self.PlayerId;
+        var firstDisconnect = WaitForPushAsync<ChatPresence>(bob, "ChatPresenceChanged",
+            presence => !presence.Online && presence.Player.PlayerId == alicePlayerId);
         await alice.StopAsync();
+        await firstDisconnect;
 
         clock.Advance(TimeSpan.FromSeconds(14));
         var carol = await ConnectAsync(factory, await RegisterPlayerAsync(client, "Carol"));
@@ -714,7 +718,10 @@ public sealed class RoomIntegrationTests : IDisposable
         clock.Advance(TimeSpan.FromSeconds(2));
         Assert.Equal(room.LeaderSteamId, (await bob.InvokeAsync<RoomSnapshot>("GetMyRoom")).LeaderSteamId);
 
+        var secondDisconnect = WaitForPushAsync<ChatPresence>(bob, "ChatPresenceChanged",
+            presence => !presence.Online && presence.Player.PlayerId == alicePlayerId);
         await aliceBack.StopAsync();
+        await secondDisconnect;
         var promotion = WaitForPushAsync<RoomSnapshot>(bob, "RoomUpdated",
             snapshot => snapshot.Id == room.Id && snapshot.LeaderSteamId == three.Members[1].SteamId);
         clock.Advance(TimeSpan.FromSeconds(15));
