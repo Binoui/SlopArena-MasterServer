@@ -114,10 +114,13 @@ jobs:
             -e Room__CatalogHash=2d31ca65507f8ce30a2fae29aa1a2bd507da6cce4905a3543f98f678ad8e441a \
             -p 127.0.0.1:18080:8080 "$IMAGE:sha-$GITHUB_SHA"
           for attempt in {1..30}; do
-            if curl --fail --silent http://127.0.0.1:18080/ready; then
+            if curl --fail --silent --show-error --max-time 3 http://127.0.0.1:18080/ready; then
               break
             fi
             if [[ "$attempt" == 30 ]]; then
+              docker port "$name"
+              docker inspect --format '{{json .NetworkSettings.Ports}} {{json .NetworkSettings.Networks}}' "$name"
+              curl --verbose --max-time 3 http://127.0.0.1:18080/ready || true
               docker logs "$name"
               exit 1
             fi
