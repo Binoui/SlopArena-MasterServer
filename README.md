@@ -192,6 +192,12 @@ runner built from the same source revision. The images use SDK
 reports immutable image digests, source revision, exact runtime, and release
 identity. Deploy by digest rather than a tag.
 
+The Docker context is an explicit source allowlist. It includes `Rooms/` alongside
+Chat, lobby, host, DTO and migration code; add newly required source directories
+to `.dockerignore` rather than broadening the context to runtime configuration or
+credentials. A successful workstation build does not prove the filtered image
+context is complete.
+
 Supply `Deployment__Profile=vps`, `Proxy__TrustedAddress` set to the exact Caddy
 IPv4, every `ApprovedHost__*` value, `MatchControl__Key`, `Jwt__Secret`, and
 `ConnectionStrings__DefaultConnection` through the deployment platform's

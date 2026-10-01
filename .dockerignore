@@ -12,6 +12,8 @@
 !Hubs/**
 !Chat/
 !Chat/**
+!Rooms/
+!Rooms/**
 !Migrations/
 !Migrations/**
 !DTOs/
