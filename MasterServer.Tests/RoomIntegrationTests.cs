@@ -560,12 +560,12 @@ public sealed class RoomIntegrationTests : IDisposable
         var unlocked = await Assert.ThrowsAsync<HubException>(() =>
             alice.InvokeAsync<RoomSnapshot>("RoomStartStageSelect"));
         Assert.Contains("lock", unlocked.Message, StringComparison.OrdinalIgnoreCase);
-        await carol.InvokeAsync<RoomSnapshot>("RoomSelectCharacter", "Kistu");
+        await carol.InvokeAsync<RoomSnapshot>("RoomSelectCharacter", "Wibou");
         var stagePush = WaitForPushAsync<RoomSnapshot>(bob, "RoomUpdated",
             snapshot => snapshot.Phase == "Stage Select");
         await alice.InvokeAsync<RoomSnapshot>("RoomStartStageSelect");
         var stage = await stagePush;
-        Assert.Equal(new[] { "Manki", "FightGuy", "Kistu" },
+        Assert.Equal(new[] { "Manki", "FightGuy", "Wibou" },
             stage.Members.Select(member => member.CharacterSelection));
         Assert.All(stage.Members, member => Assert.True(member.LockedIn));
         Assert.Null(stage.ArenaName);

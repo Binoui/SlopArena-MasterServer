@@ -71,17 +71,50 @@ jobs:
           IMAGE: ${{ steps.meta.outputs.image }}
         run: |
           name="master-smoke-$GITHUB_RUN_ID"
-          cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
+          database="$name-db"
+          network="$name-network"
+          connection="Host=$database;Database=smoke;Username=smoke;Password=smoke;Timeout=5"
+          cleanup() {
+            docker rm -fv "$name" "$database" >/dev/null 2>&1 || true
+            docker network rm "$network" >/dev/null 2>&1 || true
+          }
           trap cleanup EXIT
-          docker run -d --name "$name" --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+          docker network create --internal "$network"
+          docker run -d --name "$database" --network "$network" \
+            -e POSTGRES_USER=smoke -e POSTGRES_DB=smoke \
+            -e POSTGRES_PASSWORD=smoke \
+            postgres:15.19-bookworm@sha256:539ceaaae49b3a7c8a04467cf00cc6788d8e3f1675df41860d86eebc4c40524f
+          for attempt in {1..30}; do
+            if docker exec "$database" pg_isready -U smoke -d smoke; then
+              break
+            fi
+            if [[ "$attempt" == 30 ]]; then
+              docker logs "$database"
+              exit 1
+            fi
+            sleep 1
+          done
+          docker run --rm --network "$network" --read-only \
+            --tmpfs /tmp:rw,uid=1654,gid=1654,size=128m \
+            -e ConnectionStrings__DefaultConnection="$connection" \
+            "$IMAGE-migrations:sha-$GITHUB_SHA"
+          docker run -d --name "$name" --network "$network" --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
             -e ASPNETCORE_HTTP_PORTS=8080 \
             -e Deployment__Profile=development \
             -e Auth__Mode=development-guest \
             -e Jwt__Secret=smoke-only-not-a-production-secret-0123456789abcdef \
-            -e ConnectionStrings__DefaultConnection='Host=127.0.0.1;Port=1;Database=smoke;Username=smoke;Password=smoke;Timeout=1' \
+            -e ConnectionStrings__DefaultConnection="$connection" \
+            -e Room__AdmittedCharacters__0=Manki \
+            -e Room__AdmittedCharacters__1=FightGuy \
+            -e Room__AdmittedCharacters__2=Wibou \
+            -e Room__AdmittedCharacters__3=Bonk \
+            -e Room__AdmittedArenas__0=slop_pit \
+            -e Room__AdmittedArenas__1=slop_court \
+            -e Room__CatalogHash=2d31ca65507f8ce30a2fae29aa1a2bd507da6cce4905a3543f98f678ad8e441a \
             -p 127.0.0.1:18080:8080 "$IMAGE:sha-$GITHUB_SHA"
           for attempt in {1..30}; do
-            if curl --fail --silent http://127.0.0.1:18080/health; then
+            if curl --fail --silent http://127.0.0.1:18080/ready; then
               break
             fi
             if [[ "$attempt" == 30 ]]; then
@@ -90,8 +123,6 @@ jobs:
             fi
             sleep 1
           done
-          docker run --rm --read-only --tmpfs /tmp:rw,uid=1654,gid=1654,size=128m \
-            "$IMAGE-migrations:sha-$GITHUB_SHA" --help
 
       - name: Log in to GHCR
         env:

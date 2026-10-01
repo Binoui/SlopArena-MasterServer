@@ -198,10 +198,20 @@ to `.dockerignore` rather than broadening the context to runtime configuration o
 credentials. A successful workstation build does not prove the filtered image
 context is complete.
 
+The image smoke applies the built migration bundle to an isolated PostgreSQL
+15.19 container pinned to the deployment image digest, then checks application
+`/ready`. It supplies explicit nonsecret Room admission IDs and keeps database
+ports private. A transient `/health` response with a missing database is not
+readiness evidence.
+
 Supply `Deployment__Profile=vps`, `Proxy__TrustedAddress` set to the exact Caddy
-IPv4, every `ApprovedHost__*` value, `MatchControl__Key`, `Jwt__Secret`, and
+IPv4, every `ApprovedHost__*` value, `MatchControl__Key`, `Jwt__Secret`,
+`Room__AdmittedCharacters__*`, `Room__AdmittedArenas__*`, `Room__CatalogHash`, and
 `ConnectionStrings__DefaultConnection` through the deployment platform's
-configuration/secret manager. Neither local settings nor secrets are included
+configuration/secret manager. Room characters must match the deployed
+Manki/FightGuy/Wibou/Bonk catalog and its exact match-catalog digest; an old Kistu
+selector or catalog hash prevents compatible matchmaking. Neither local settings
+nor secrets are included
 in the images. The application listens on port 8080 and does not apply
 migrations during startup. Run migrations separately before deploying the
 application, passing the connection as an environment secret:
