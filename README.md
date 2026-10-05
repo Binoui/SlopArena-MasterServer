@@ -47,6 +47,16 @@ Requires PostgreSQL and the ASP.NET Core 8 runtime. Development settings come fr
 `appsettings.Development.json`; production settings use environment variables.
 Copying `.env.example` does not load its values into ASP.NET automatically.
 
+### OMP semantic navigation
+
+The navigation-only `.omp/MasterServer.sln` includes the service and
+`MasterServer.Tests`; `.omp/lsp.json` selects it when OMP starts in this checkout.
+The enclosing SlopArena workspace loads both repositories through its own
+`.omp/SlopArena.Workspace.sln`, since OMP does not discover nested LSP configs.
+Adjust the executable/checkout paths when moving machines. After configuration
+changes, call LSP with `action: "reload", file: "*"`. Use canonical absolute file
+paths through workspace symlinks so queries match the loaded project documents.
+
 ## Deployment profiles and credentials
 
 `Deployment:Profile` is required; there is no implicit production fallback.
@@ -111,7 +121,7 @@ literal.
 
 In VPS mode, `/servers/register` requires the provisioned host GUID,
 `Authorization: Bearer <ApprovedHost:RegistrationKey>`, canonical decimal-string
-GameHost `steamId`, `protocolVersion: 4`, nonempty per-process `instanceId` GUID,
+GameHost `steamId`, `protocolVersion: 6`, nonempty per-process `instanceId` GUID,
 and lowercase SHA-256 `catalogHash` of the admitted immutable content map.
 Master ignores request IP/UDP address and official flag. A heartbeat with a
 changed identity or catalog hash immediately makes the old browser entry
@@ -129,7 +139,7 @@ Master creates the authoritative Match row and roster before its private
 content identity. GameHost rejects a changed local map before allocation and
 responds with cooked content, the matching digest and its own verified Steam
 identity. Only that roster receives a `MatchStarted.descriptor` (`steam-p2p`,
-host identity, GUID, virtual port 0, protocol 4, content digest, admission
+host identity, GUID, virtual port 0, protocol 6, content digest, admission
 deadline); old clients are denied a VPS lobby slot. GameHost controls admission
 and authoritative simulation.
 It reports normal results once, or calls authenticated `POST /match/cancel`
@@ -139,6 +149,13 @@ signals `MatchAborted` to the roster, and retains Global/Server/Direct chat
 membership. Neither a temporary Steam web-auth outage nor Master unavailability
 ends a match already admitted at GameHost. Do not deploy these changes without
 a compatible Master/GameHost/client release and the DB migrations.
+
+Protocol 6 is a coordinated GameHost/client/Master cutover. The GameHost sends
+fixed-size versioned Bootstrap/Ready/Clock controls on Steam and development
+UDP; a client acknowledges readiness only after receiving the full roster's
+initial states. The server clock, not local loading or GO receipt time, defines
+the gameplay start tick. Protocol 5 clients and registrations are incompatible;
+do not roll out one side independently.
 
 `Proxy:TrustedAddress` must be one static IPv4 address (for example, the local
 Compose Caddy proxy at `172.30.11.10`); wildcard addresses and IPv6 are rejected.

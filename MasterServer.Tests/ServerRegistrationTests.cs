@@ -122,7 +122,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         CustomRulesJson: null,
         HostId: ApprovedHostId,
         SteamId: "90293421017699331",
-        ProtocolVersion: 4,
+        ProtocolVersion: SteamMatchDescriptor.Protocol,
         InstanceId: HostInstance,
         CatalogHash: new string('a', 64));
 
@@ -447,7 +447,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
         Assert.Equal(28765, row.Port);
         Assert.True(row.IsOfficial);
         Assert.Equal("90293421017699331", row.SteamId);
-        Assert.Equal(4, row.ProtocolVersion);
+        Assert.Equal(SteamMatchDescriptor.Protocol, row.ProtocolVersion);
         Assert.Equal(3, row.CurrentMatches);
 
         Assert.NotEqual(second.ApiToken, row.ApiTokenHash);
@@ -531,7 +531,7 @@ public class ServerRegistrationTests : IClassFixture<WebApplicationFactory<Progr
     {
         using var client = CreateVpsClient();
         using var response = await PostVpsRegistrationAsync(
-            client, VpsRequest() with { ProtocolVersion = 2 }, RegistrationKey);
+            client, VpsRequest() with { ProtocolVersion = SteamMatchDescriptor.Protocol - 1 }, RegistrationKey);
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.Equal(0, await CountVpsGameServersAsync());

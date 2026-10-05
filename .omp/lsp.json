@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "omnisharp": {
+      "command": "/home/binoui/.dotnet/tools/omnisharp",
+      "args": ["-lsp", "-s", "/home/binoui/Documents/projects/SlopArena-MasterServer/.omp/MasterServer.sln"],
+      "fileTypes": [".cs"],
+      "languageId": "csharp",
+      "rootMarkers": ["MasterServer.csproj"]
+    }
+  }
+}

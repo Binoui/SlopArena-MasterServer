@@ -45,7 +45,7 @@ public sealed record SteamMatchDescriptor(
     string ContentHash,
     DateTimeOffset AdmissionExpiresAtUtc)
 {
-    public const int Protocol = 4;
+    public const int Protocol = 6;
 }
 
 
