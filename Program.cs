@@ -198,6 +198,31 @@ app.Use(async (context, next) =>
 
 
 app.MapGet("/health", () => new { status = "ok", version = "0.1.0" });
+app.MapGet("/owner/observation", async (
+    HttpContext httpContext,
+    IConfiguration configuration,
+    AppDbContext db,
+    ChatService chat,
+    RoomManager rooms,
+    LobbyManager lobbies,
+    TimeProvider clock) =>
+{
+    httpContext.Response.Headers["Cache-Control"] = "no-store";
+    var key = configuration["Console:Key"];
+    if (key is null || key.Length < 32)
+        return Results.NotFound();
+
+    var supplied = httpContext.Request.Headers["X-Console-Key"].ToString();
+    var expectedHash = SHA256.HashData(Encoding.UTF8.GetBytes(key));
+    var suppliedHash = SHA256.HashData(Encoding.UTF8.GetBytes(supplied));
+    if (!CryptographicOperations.FixedTimeEquals(expectedHash, suppliedHash))
+        return Results.Unauthorized();
+
+    var snapshot = await OwnerObservationSnapshotBuilder.CaptureAsync(
+        db, chat, rooms, lobbies, clock, httpContext.RequestAborted);
+    return Results.Ok(snapshot);
+});
+
 app.MapGet("/ready", async (AppDbContext db, CancellationToken requestAborted) =>
 {
     using var timeout = CancellationTokenSource.CreateLinkedTokenSource(requestAborted);

@@ -20,6 +20,7 @@ host/address lookup and waiting-roster control remain development-only.
 | `POST /servers/{id}/heartbeat` | GameHost liveness/load and current identity check |
 | `GET /servers` | Physical GameHost lookup in development only; VPS returns 404 |
 | `POST /match/result`, `POST /match/cancel` | Authenticated terminal Match report, matching Room return; cancellation has no winner |
+| `GET /owner/observation` | Dedicated owner-key read-only snapshot for the private console; disabled until configured |
 | `/lobby` (SignalR) | Authenticated public Rooms, Room chat and scoped Match route; development-only physical lobbies |
 
 ## Tech Stack
@@ -382,6 +383,51 @@ Hub errors include stable prefixes and guidance: `invalid_room_name`, `room_limi
 `not_leader`, `invalid_phase`, `room_not_ready`, `character_not_admitted`, and
 `arena_not_admitted`.
 
+## Owner observation API
+
+`GET /owner/observation` is a read-only inspection endpoint for a private owner
+console. Set `Console:Key` (environment variable `Console__Key`) to an
+independent secret of at least 32 characters. An absent or shorter key disables
+the route with 404; a missing or invalid `X-Console-Key` returns 401. Player
+JWTs do not authorize this endpoint. The response uses `Cache-Control: no-store`
+for success and rejection responses. Never put the key in a URL, browser
+storage, logs, or source control. Keep this route out of public ingress even
+when its credential is configured.
+
+The camelCase response contains `capturedAtUtc`, `players`, `rooms`, `lobbies`,
+`matches`, `globalChat`, and `servers`. All timestamps are UTC ISO 8601;
+nullable links and lifecycle times remain explicit `null` values. Player,
+room-member, lobby-member, and Match-roster Steam identities are decimal strings
+to preserve their full 64-bit value.
+
+- `players` is Master Chat presence, with `masterConnected: true` and current
+  Room, running Match, and development waiting-lobby links where those sources
+  establish them. Missing links are `null`; `gameServerConnectivity` is always
+  `unknown` because Master presence is not evidence of GameServer transport.
+- `rooms` projects RoomManager membership, leader, phase, selection, lock-in,
+  capacity, joinability, Arena and active Match ID. `lobbies` is the separate
+  development-only waiting roster; it does not claim GameServer connectivity.
+- `matches` includes every running persisted Match plus at most the 50 newest
+  terminal rows. Rosters use stored Player names where available; status is
+  `running`, `completed`, or `canceled`, and elapsed seconds stop at the
+  corresponding terminal timestamp. Canceled time takes precedence if both
+  terminal timestamps exist.
+  `startedAtUtc` is Master's launch-record timestamp, not proof of gameplay
+  starting; elapsed time measures from that record, not the GameServer clock.
+- `globalChat` is only the existing bounded public Global history (up to 50
+  messages). Direct messages and Room chat are not exposed.
+- `servers` reports stored heartbeat time, age, `fresh` status only while the
+  heartbeat is less than 15 seconds old, current/max matches, and
+  `max(0, maxConcurrentMatches - currentMatches)` available slots. It omits
+  addresses, ports, GameServer identities, API-token hashes, catalog hashes,
+  and custom rules.
+
+Presence, public chat history, Rooms, and development waiting lobbies are
+volatile Master-process state and disappear on restart. Persisted Match and
+GameServer rows remain database-backed. Each source is snapshotted under its
+existing synchronization or database query; the response is not an atomic
+cross-store transaction and makes no claim of one.
+
 ## Chat client contract
 
 This is the Master-side contract for [SlopArena chat](https://github.com/Binoui/SlopArena/issues/206).
@@ -494,6 +540,7 @@ workflows. VPS rejects `JoinLobby` and `ResumeServer` with
 Development physical membership never grants Server Chat; the normal
 browser and Room preparation use Room methods instead.
 
+
 Direct reaches the sender's and target identity's live connections, once each.
 An offline target fails. There is no server-side Direct history or offline queue,
 and a new guest with the same name is not the old recipient.
@@ -541,6 +588,35 @@ Run the actual test project, not the web project:
 ```bash
 dotnet test MasterServer.Tests/MasterServer.Tests.csproj --nologo
 ```
+
+Run only the focused owner observation integration suite with:
+
+```bash
+dotnet test MasterServer.Tests/MasterServer.Tests.csproj --filter FullyQualifiedName~OwnerObservationIntegrationTests --nologo
+```
+
+It exercises HTTP through TestServer and real SignalR long-polling clients
+against isolated EF InMemory databases. That is not TCP delivery proof. For a
+real Kestrel/SignalR smoke, use a disposable local PostgreSQL database with a
+unique name, not any playtest database:
+
+```bash
+export ASPNETCORE_ENVIRONMENT=Development
+export Deployment__Profile=development
+export Auth__Mode=development-guest
+export ConnectionStrings__DefaultConnection='Host=127.0.0.1;Port=5432;Database=master_console_smoke_unique;Username=<local-user>;Password=<local-password>'
+export Console__Key="$(openssl rand -base64 48)"
+dotnet tool restore
+dotnet ef database update
+dotnet run --urls http://127.0.0.1:18080
+```
+
+Use the same isolated database and the console key from a protected local shell
+to check an anonymous 401 and an owner-key response; connect actual development
+player clients to `/lobby` and exercise Room/global-chat transitions at the same
+time. Verify restart clears presence, Rooms, waiting lobbies, and chat while
+the same database retains Match and GameServer rows. Never use a production
+connection string or expose the owner route through public ingress.
 
 SignalR integration tests exercise the live ASP.NET pipeline over TestServer and
 use isolated EF InMemory stores. Registration tests cover development and VPS

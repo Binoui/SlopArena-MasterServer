@@ -107,6 +107,12 @@ public sealed class RoomManager(TimeProvider clock, IConfiguration configuration
             return _rooms.Values.Select(ToSummary).ToArray();
     }
 
+    internal RoomObservationSnapshot[] GetOwnerObservationSnapshots()
+    {
+        lock (_gate)
+            return _rooms.Values.Select(ToOwnerObservationSnapshot).ToArray();
+    }
+
     public RoomSnapshot? GetMyRoom(long steamId)
     {
         lock (_gate)
@@ -493,14 +499,25 @@ public sealed class RoomManager(TimeProvider clock, IConfiguration configuration
 
     private RoomSnapshot ToSnapshot(Room room)
     {
-        var members = room.Members
-            .Select(member => new RoomMember(member.SteamId, member.Name,
-                member.SteamId == room.LeaderSteamId, member.CharacterSelection, member.LockedIn))
-            .ToArray();
+        var members = ToMembers(room);
         return new RoomSnapshot(room.Id, room.Name, room.Phase, room.LeaderSteamId, members,
             members.Length, MaxMembers, room.Phase == "Lobby" && members.Length < MaxMembers,
             room.ArenaName, _characters.ToArray(), _arenas.ToArray(), room.ActiveMatchId);
     }
+
+    private static RoomObservationSnapshot ToOwnerObservationSnapshot(Room room)
+    {
+        var members = ToMembers(room);
+        return new RoomObservationSnapshot(room.Id, room.Name, room.Phase, room.LeaderSteamId, members,
+            members.Length, MaxMembers, room.Phase == "Lobby" && members.Length < MaxMembers,
+            room.ArenaName, room.ActiveMatchId);
+    }
+
+    private static RoomMember[] ToMembers(Room room)
+        => room.Members
+            .Select(member => new RoomMember(member.SteamId, member.Name,
+                member.SteamId == room.LeaderSteamId, member.CharacterSelection, member.LockedIn))
+            .ToArray();
 
     private static RoomSummary ToSummary(Room room)
         => new(room.Id, room.Name, room.Phase, room.LeaderSteamId, room.Members.Count,

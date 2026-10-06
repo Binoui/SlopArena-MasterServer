@@ -18,6 +18,19 @@ public sealed record RoomSnapshot(
     IReadOnlyList<string> AdmittedCharacters,
     IReadOnlyList<string> AdmittedArenas,
     Guid? ActiveMatchId = null);
+
+internal sealed record RoomObservationSnapshot(
+    Guid Id,
+    string Name,
+    string Phase,
+    long LeaderSteamId,
+    IReadOnlyList<RoomMember> Members,
+    int MemberCount,
+    int Capacity,
+    bool Joinable,
+    string? ArenaName,
+    Guid? ActiveMatchId);
+
 public sealed record RoomLaunchPreparation(Guid RoomId, Guid MatchId, string ArenaName,
     IReadOnlyList<LobbyPlayer> Players);
 

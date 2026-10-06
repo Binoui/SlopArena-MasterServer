@@ -198,6 +198,13 @@ public sealed class ChatService
             return _identities.Values.Select(identity => identity.Profile).ToArray();
     }
 
+    internal (ChatPlayer[] Players, ChatMessage[] GlobalMessages) GetOwnerObservationSnapshot()
+    {
+        lock (_lock)
+            return (_identities.Values.Select(identity => identity.Profile).ToArray(),
+                _globalHistory.ToArray());
+    }
+
     internal void CheckControlRate(string connectionId)
     {
         lock (_lock)

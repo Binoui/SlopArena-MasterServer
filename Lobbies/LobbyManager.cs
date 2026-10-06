@@ -188,6 +188,9 @@ public sealed class LobbyManager
             return _lobbyByConnection.TryGetValue(connectionId, out var lobby) ? lobby.Snapshot() : null;
     }
 
+    internal LobbySnapshot[] GetOwnerObservationSnapshots()
+        => _lobbiesByServer.Values.Select(lobby => lobby.Snapshot()).ToArray();
+
     /// <summary>Attempts a host start for the waiting roster.</summary>
     public HostStartResult TryHostStart(string connectionId)
     {
