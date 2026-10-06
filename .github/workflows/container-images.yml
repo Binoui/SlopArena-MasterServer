@@ -1,6 +1,33 @@
 name: Container images
 
 on:
+  workflow_call:
+    inputs:
+      release_id:
+        description: Release identity (no latest)
+        required: true
+        type: string
+      source_revision:
+        description: Full Master source commit SHA
+        required: true
+        type: string
+    secrets:
+      publish_token:
+        description: Token with read access to Master and write access to GHCR
+        required: false
+    outputs:
+      master_image:
+        description: Exact published Master image reference including digest
+        value: ${{ jobs.images.outputs.master_image }}
+      migration_image:
+        description: Exact published migration image reference including digest
+        value: ${{ jobs.images.outputs.migration_image }}
+      source_revision:
+        description: Checked-out Master source commit SHA
+        value: ${{ jobs.images.outputs.source_revision }}
+      target_migration:
+        description: Latest EF migration ID in the checked-out source
+        value: ${{ jobs.images.outputs.target_migration }}
   workflow_dispatch:
     inputs:
       release_id:
@@ -23,11 +50,44 @@ jobs:
     outputs:
       app_digest: ${{ steps.publish.outputs.app_digest }}
       migration_digest: ${{ steps.publish.outputs.migration_digest }}
-      source_revision: ${{ github.sha }}
+      master_image: ${{ steps.publish.outputs.master_image }}
+      migration_image: ${{ steps.publish.outputs.migration_image }}
+      source_revision: ${{ steps.checkout.outputs.source_revision }}
+      target_migration: ${{ steps.migration.outputs.target_migration }}
       runtime: mcr.microsoft.com/dotnet/sdk:8.0.425-bookworm-slim; mcr.microsoft.com/dotnet/aspnet:8.0.31-bookworm-slim; mcr.microsoft.com/dotnet/runtime-deps:8.0.31-bookworm-slim; linux/amd64
       release_identity: ${{ steps.meta.outputs.id }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          repository: Binoui/SlopArena-MasterServer
+          ref: ${{ inputs.source_revision || github.sha }}
+          token: ${{ secrets.publish_token || secrets.GITHUB_TOKEN }}
+      - name: Verify pinned source checkout
+        id: checkout
+        env:
+          EXPECTED_SOURCE_REVISION: ${{ inputs.source_revision || github.sha }}
+        run: |
+          if [[ ! "$EXPECTED_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Source revision must be a full lowercase commit SHA' >&2
+            exit 1
+          fi
+          actual="$(git rev-parse HEAD)"
+          if [[ "$actual" != "$EXPECTED_SOURCE_REVISION" ]]; then
+            echo "Checked out $actual, expected $EXPECTED_SOURCE_REVISION" >&2
+            exit 1
+          fi
+          echo "source_revision=$actual" >> "$GITHUB_OUTPUT"
+
+      - name: Identify latest EF migration
+        id: migration
+        run: |
+          target="$(grep -rhoE '\[Migration\("[0-9]{14}_[A-Za-z0-9_]+"\)\]' Migrations --include='*.cs' \
+            | grep -oE '"[0-9]{14}_[A-Za-z0-9_]+"' | tr -d '"' | sort -u | tail -n 1)"
+          if [[ ! "$target" =~ ^[0-9]{14}_[A-Za-z0-9_]+$ ]]; then
+            echo 'Could not derive canonical EF migration ID from checked-out Migrations attributes' >&2
+            exit 1
+          fi
+          echo "target_migration=$target" >> "$GITHUB_OUTPUT"
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
@@ -44,7 +104,6 @@ jobs:
         env:
           INPUT_ID: ${{ inputs.release_id }}
           REF_ID: ${{ github.event.release.tag_name }}
-          REPOSITORY: ${{ github.repository }}
         run: |
           id="${REF_ID:-$INPUT_ID}"
           if [[ ! "$id" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$ ]]; then
@@ -52,23 +111,30 @@ jobs:
             exit 1
           fi
           echo "id=$id" >> "$GITHUB_OUTPUT"
-          echo "image=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/binoui/sloparena-masterserver" >> "$GITHUB_OUTPUT"
 
       - name: Build Linux amd64 images locally
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
           RELEASE_ID: ${{ steps.meta.outputs.id }}
+          SOURCE_REVISION: ${{ steps.checkout.outputs.source_revision }}
         run: |
           docker buildx build --platform linux/amd64 --load --target master \
-            --build-arg SOURCE_REVISION="$GITHUB_SHA" --build-arg RELEASE_ID="$RELEASE_ID" \
-            -t "$IMAGE:sha-$GITHUB_SHA" .
+            --build-arg SOURCE_REVISION="$SOURCE_REVISION" --build-arg RELEASE_ID="$RELEASE_ID" \
+            -t "$IMAGE:sha-$SOURCE_REVISION" .
           docker buildx build --platform linux/amd64 --load --target migrations \
-            --build-arg SOURCE_REVISION="$GITHUB_SHA" --build-arg RELEASE_ID="$RELEASE_ID" \
-            -t "$IMAGE-migrations:sha-$GITHUB_SHA" .
+            --build-arg SOURCE_REVISION="$SOURCE_REVISION" --build-arg RELEASE_ID="$RELEASE_ID" \
+            -t "$IMAGE-migrations:sha-$SOURCE_REVISION" .
+          for image in "$IMAGE:sha-$SOURCE_REVISION" "$IMAGE-migrations:sha-$SOURCE_REVISION"; do
+            revision_label="$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+            version_label="$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')"
+            [[ "$revision_label" == "$SOURCE_REVISION" && "$version_label" == "$RELEASE_ID" ]]
+          done
 
       - name: Smoke app and migration images before publishing
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
+          SOURCE_REVISION: ${{ steps.checkout.outputs.source_revision }}
         run: |
           name="master-smoke-$GITHUB_RUN_ID"
           database="$name-db"
@@ -97,7 +163,7 @@ jobs:
           docker run --rm --network "$network" --read-only \
             --tmpfs /tmp:rw,uid=1654,gid=1654,size=128m \
             -e ConnectionStrings__DefaultConnection="$connection" \
-            "$IMAGE-migrations:sha-$GITHUB_SHA"
+            "$IMAGE-migrations:sha-$SOURCE_REVISION"
           docker run -d --name "$name" --network "$network" --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=16m \
             -e ASPNETCORE_HTTP_PORTS=8080 \
@@ -112,7 +178,7 @@ jobs:
             -e Room__AdmittedArenas__0=slop_pit \
             -e Room__AdmittedArenas__1=slop_court \
             -e Room__CatalogHash=2d31ca65507f8ce30a2fae29aa1a2bd507da6cce4905a3543f98f678ad8e441a \
-            "$IMAGE:sha-$GITHUB_SHA"
+            "$IMAGE:sha-$SOURCE_REVISION"
           address="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$name")"
           [[ -n "$address" ]] || { docker inspect "$name"; exit 1; }
           for attempt in {1..30}; do
@@ -128,33 +194,44 @@ jobs:
 
       - name: Log in to GHCR
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          GH_TOKEN: ${{ secrets.publish_token || secrets.GITHUB_TOKEN }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u Binoui --password-stdin
 
       - name: Push only after tests and smoke
         id: publish
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
           RELEASE_ID: ${{ steps.meta.outputs.id }}
+          SOURCE_REVISION: ${{ steps.checkout.outputs.source_revision }}
+          TARGET_MIGRATION: ${{ steps.migration.outputs.target_migration }}
         run: |
-          docker tag "$IMAGE:sha-$GITHUB_SHA" "$IMAGE:$RELEASE_ID"
-          docker tag "$IMAGE-migrations:sha-$GITHUB_SHA" "$IMAGE-migrations:$RELEASE_ID"
-          docker push "$IMAGE:sha-$GITHUB_SHA"
+          docker tag "$IMAGE:sha-$SOURCE_REVISION" "$IMAGE:$RELEASE_ID"
+          docker tag "$IMAGE-migrations:sha-$SOURCE_REVISION" "$IMAGE-migrations:$RELEASE_ID"
+          docker push "$IMAGE:sha-$SOURCE_REVISION"
           docker push "$IMAGE:$RELEASE_ID"
-          docker push "$IMAGE-migrations:sha-$GITHUB_SHA"
+          docker push "$IMAGE-migrations:sha-$SOURCE_REVISION"
           docker push "$IMAGE-migrations:$RELEASE_ID"
-          app_ref="$(docker image inspect "$IMAGE:sha-$GITHUB_SHA" --format '{{index .RepoDigests 0}}')"
-          migrations_ref="$(docker image inspect "$IMAGE-migrations:sha-$GITHUB_SHA" --format '{{index .RepoDigests 0}}')"
-          app_digest="${app_ref##*@}"
-          migration_digest="${migrations_ref##*@}"
-          test -n "$app_digest" && test -n "$migration_digest"
-          echo "app_digest=$app_digest" >> "$GITHUB_OUTPUT"
-          echo "migration_digest=$migration_digest" >> "$GITHUB_OUTPUT"
+          master_ref="$(docker image inspect "$IMAGE:sha-$SOURCE_REVISION" --format '{{index .RepoDigests 0}}')"
+          migration_ref="$(docker image inspect "$IMAGE-migrations:sha-$SOURCE_REVISION" --format '{{index .RepoDigests 0}}')"
+          [[ "$master_ref" =~ ^ghcr\.io/binoui/sloparena-masterserver@sha256:[0-9a-f]{64}$ ]]
+          [[ "$migration_ref" =~ ^ghcr\.io/binoui/sloparena-masterserver-migrations@sha256:[0-9a-f]{64}$ ]]
+          echo "app_digest=${master_ref##*@}" >> "$GITHUB_OUTPUT"
+          echo "migration_digest=${migration_ref##*@}" >> "$GITHUB_OUTPUT"
+          echo "master_image=$master_ref" >> "$GITHUB_OUTPUT"
+          echo "migration_image=$migration_ref" >> "$GITHUB_OUTPUT"
+          printf '{"release_id":"%s","master_image":"%s","migration_image":"%s","source_revision":"%s","target_migration":"%s"}\n' \
+            "$RELEASE_ID" "$master_ref" "$migration_ref" "$SOURCE_REVISION" "$TARGET_MIGRATION" > master-images.json
           {
             echo '### Published Master images'
-            echo "- Master: \`$IMAGE@$app_digest\`"
-            echo "- Migrations: \`$IMAGE-migrations@$migration_digest\`"
-            echo "- Source revision: \`$GITHUB_SHA\`"
+            echo "- Master: \`$master_ref\`"
+            echo "- Migrations: \`$migration_ref\`"
+            echo "- Source revision: \`$SOURCE_REVISION\`"
+            echo "- Target migration: \`$TARGET_MIGRATION\`"
             echo '- Runtime: SDK 8.0.425-bookworm-slim; ASP.NET 8.0.31-bookworm-slim; runtime-deps 8.0.31-bookworm-slim; linux/amd64; PostgreSQL 15 target'
             echo "- Release identity: \`$RELEASE_ID\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: master-images-${{ steps.checkout.outputs.source_revision }}
+          path: master-images.json

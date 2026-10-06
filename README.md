@@ -199,15 +199,25 @@ operator-reviewed database recovery and host re-enrollment.
 
 ## Container release and migrations
 
-The `Container images` workflow tests and publishes only for a manual dispatch
-from `main` or a published GitHub release. Manual dispatch requires a `release_id`
+The `Container images` workflow tests and publishes for a manual dispatch
+from `main`, a published GitHub release, or the trusted SlopArena Playtest
+coordinator through `workflow_call`. Manual dispatch requires a `release_id`
 matching `[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}`. It publishes independent Linux amd64
 images to GHCR: the ASP.NET Core 8 application and a self-contained EF migration
 runner built from the same source revision. The images use SDK
 `8.0.425-bookworm-slim` and ASP.NET/runtime-deps
 `8.0.31-bookworm-slim`; migrations target PostgreSQL 15. The workflow summary
-reports immutable image digests, source revision, exact runtime, and release
-identity. Deploy by digest rather than a tag.
+reports immutable image digests, source revision, exact runtime, target migration
+and release identity. Deploy by digest rather than a tag.
+
+Reusable callers supply `release_id` and a full lowercase `source_revision` SHA.
+The workflow checks out this repository explicitly, not the caller's repository,
+and exports `master_image`, `migration_image`, `source_revision` and
+`target_migration`. Cross-repository callers pass `publish_token` with private
+source read and GHCR package-write access; direct runs use their own
+`GITHUB_TOKEN`. The game coordinator and one-time protected deployment setup are
+documented in [SlopArena's release pipeline](https://github.com/Binoui/SlopArena/blob/main/docs/systems/release-pipeline.md).
+Publication alone does not deploy the VPS or activate a Steam build.
 
 The Docker context is an explicit source allowlist. It includes `Rooms/` alongside
 Chat, lobby, host, DTO and migration code; add newly required source directories
